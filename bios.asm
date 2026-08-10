@@ -23,6 +23,10 @@ RAM_SERIAL_ON equ 0x050C     ; byte: 1 = COM1-вывод включён
 RAM_VGA_ON    equ 0x050D     ; byte: 1 = VGA-вывод включён
 RAM_BREAK_FLAG equ 0x050E    ; byte: 1, если только что пришёл префикс F0 (break)
 RAM_VIDEO_MODE equ 0x050F    ; byte: текущий видеорежим (для int 10h AH=0x0F)
+RAM_KBD_SHIFT  equ 0x0510    ; byte: 1 = Shift (левый или правый) сейчас зажат
+RAM_KBD_PENDING equ 0x0511   ; byte: 1 = есть декодированная клавиша, ждущая выборки
+RAM_KBD_PENDING_CHAR equ 0x0512 ; byte: ASCII-код ожидающей клавиши
+RAM_KBD_PENDING_SCAN equ 0x0513 ; byte: сырой Scan Set 2 код ожидающей клавиши
 
 start:
     cli
@@ -49,6 +53,11 @@ start:
     ; мог пользоваться обычным "int 10h" вместо прямого call наших
     ; функций, как это делает настоящий BIOS.
     call install_int10h_vector
+
+    ; Аналогично - int 16h (клавиатурные сервисы), вектор 0x16*4.
+    ; Загруженный код может читать клавиатуру через "int 16h" вместо
+    ; прямого поллинга портов 0x60/0x64, как это делает настоящий BIOS.
+    call install_int16h_vector
 
     call init_serial
 
@@ -373,6 +382,244 @@ int10h_get_mode:
     mov ah, 80
     mov bh, 0
     ret
+
+; =========================================================
+; int 16h - клавиатурные сервисы. Поддерживаются:
+;   AH=0x00 - блокирующее чтение символа (-> AL=ASCII, AH=сырой скан-код)
+;   AH=0x01 - неблокирующая проверка (ZF=1 если клавиш нет; иначе
+;             ZF=0 и AL/AH заполнены, КАК И в AH=0x00, но клавиша НЕ
+;             потребляется - следующий AH=0x00/0x01 увидит её снова)
+; Поверх того же "сырого" поллинга портов 0x60/0x64 (Scan Set 2), что
+; уже используется в setup_menu, но декодированного в ASCII через
+; таблицы kbd_ascii_lo/kbd_ascii_hi и с учётом состояния Shift.
+; Не поддерживаются: numpad, функциональные и прочие клавиши без
+; ASCII-эквивалента (тихо игнорируются, как и всё вне MAX_SCAN), а
+; также расширенные (E0-префиксные) клавиши в общем случае - E0
+; просто пропускается, и следующий байт трактуется как обычный (тот
+; же приём, что и в setup_menu); из-за этого расширенный код клавиши
+; может случайно совпасть с кодом обычной клавиши на numpad (см.
+; комментарий у MAX_SCAN) - осознанное упрощение, а не баг.
+;
+; AH=0x01 - особый случай регистровой конвенции: результат нужно
+; вернуть через флаг ZF, а "iret" восстанавливает FLAGS из стека (то,
+; что запушил сам "int"), а не из текущего регистра флагов - поэтому
+; после вызова обработчика приходится патчить слово FLAGS в кадре
+; стека напрямую. CX/DX используются как scratch и не сохраняются -
+; для AH=0x01 это не задокументированный вывод, как и в настоящем BIOS.
+; =========================================================
+install_int16h_vector:
+    push ax
+    push es
+
+    xor ax, ax
+    mov es, ax
+    mov word [es:0x16*4], int16h_isr
+    mov word [es:0x16*4+2], cs
+
+    ; гарантируем чистое состояние автомата разбора клавиатуры -
+    ; RAM не обязана быть обнулена на старте (реальное железо после
+    ; power-on этого не гарантирует).
+    mov byte [ss:RAM_BREAK_FLAG], 0
+    mov byte [ss:RAM_KBD_SHIFT], 0
+    mov byte [ss:RAM_KBD_PENDING], 0
+
+    pop es
+    pop ax
+    ret
+
+int16h_isr:
+    push si
+    push di
+    push bp
+    push ds
+    push es
+
+    cmp ah, 0x00
+    je .fn_00
+    cmp ah, 0x01
+    je .fn_01
+    jmp .done                 ; неподдерживаемая функция - молча игнорируем
+
+.fn_00:
+    pop es
+    pop ds
+    pop bp
+    pop di
+    pop si
+    call int16h_read_char     ; блокирующее чтение - AL=ASCII, AH=скан-код
+    iret
+
+.fn_01:
+    pop es
+    pop ds
+    pop bp
+    pop di
+    pop si
+    ; стек уже чист: [sp]=IP [sp+2]=CS [sp+4]=FLAGS(оригинал - его и
+    ; восстановит iret)
+    call int16h_check_key     ; ZF: 1=клавиш нет, 0=есть (+AL/AH)
+
+    jz .no_key
+    xor cx, cx                    ; ZF было 0 (клавиша есть) -> патченный ZF=0
+    jmp .have_zf
+.no_key:
+    mov cx, 0x0040                 ; ZF было 1 (клавиш нет) -> патченный ZF=1
+.have_zf:
+    push bp
+    mov bp, sp
+    ; [bp+0]=наш push bp, [bp+2]=IP, [bp+4]=CS, [bp+6]=FLAGS(оригинал)
+    mov dx, [ss:bp+6]
+    and dx, 0xFFBF                ; сбрасываем бит ZF
+    or dx, cx                      ; проставляем вычисленный
+    mov [ss:bp+6], dx
+    pop bp
+    iret
+
+.done:
+    pop es
+    pop ds
+    pop bp
+    pop di
+    pop si
+    iret
+
+; Блокирующее чтение (AH=0x00): крутится в kbd_service, пока не
+; появится декодированная клавиша, затем забирает её из "буфера"
+; (сбрасывая RAM_KBD_PENDING - в отличие от AH=0x01, эта функция
+; клавишу ПОТРЕБЛЯЕТ). "Get"-функция - AX не сохраняется, в нём
+; возвращается результат.
+int16h_read_char:
+.wait:
+    call kbd_service
+    cmp byte [ss:RAM_KBD_PENDING], 0
+    je .wait
+
+    mov al, [ss:RAM_KBD_PENDING_CHAR]
+    mov ah, [ss:RAM_KBD_PENDING_SCAN]
+    mov byte [ss:RAM_KBD_PENDING], 0
+    ret
+
+; Неблокирующая проверка (AH=0x01): один раз пытается продвинуть
+; kbd_service, затем смотрит "буфер" - НЕ потребляет клавишу (в
+; отличие от int16h_read_char), поэтому следующий вызов увидит её
+; снова. ZF отражает результат для вызывающего кода (см. .fn_01 в
+; int16h_isr, где это транслируется через стек в реальный iret).
+int16h_check_key:
+    call kbd_service
+    cmp byte [ss:RAM_KBD_PENDING], 0
+    je .none
+
+    mov al, [ss:RAM_KBD_PENDING_CHAR]
+    mov ah, [ss:RAM_KBD_PENDING_SCAN]
+    ret
+.none:
+    ret
+
+; Продвигает автомат разбора клавиатуры максимум на один "сырой" байт
+; Scan Set 2, если он уже доступен у контроллера (порт 0x64, бит 0) -
+; НЕ блокирует. Логика E0/F0 - та же, что в setup_menu (см. её
+; комментарий): E0 просто пропускается, F0 выставляет RAM_BREAK_FLAG
+; на один байт вперёд. Shift (0x12/0x59) обрабатывается отдельно - не
+; как обычная клавиша, а как модификатор для kbd_ascii_hi/_lo. Если
+; уже есть непотреблённая клавиша (RAM_KBD_PENDING=1) - ничего не
+; делает, чтобы её не затереть до того, как её заберут.
+kbd_service:
+    push ax
+    push bx
+
+    cmp byte [ss:RAM_KBD_PENDING], 0
+    jne .done
+
+    in al, 0x64
+    test al, 0x01
+    jz .done                    ; данных нет - неблокирующий выход
+
+    in al, 0x60
+
+    cmp al, 0xE0
+    je .done                     ; префикс расширенной клавиши - пропускаем
+
+    cmp al, 0xF0
+    jne .not_break_prefix
+    mov byte [ss:RAM_BREAK_FLAG], 1
+    jmp .done
+.not_break_prefix:
+
+    cmp byte [ss:RAM_BREAK_FLAG], 0
+    je .make_event
+
+    ; код ОТПУСКАНИЯ (после F0) - из всех клавиш нас интересует
+    ; только отпускание Shift, остальное как и раньше просто игнорируем
+    mov byte [ss:RAM_BREAK_FLAG], 0
+    cmp al, 0x12
+    je .shift_release
+    cmp al, 0x59
+    je .shift_release
+    jmp .done
+.shift_release:
+    mov byte [ss:RAM_KBD_SHIFT], 0
+    jmp .done
+
+.make_event:
+    cmp al, 0x12
+    je .shift_press
+    cmp al, 0x59
+    je .shift_press
+
+    cmp al, MAX_SCAN
+    ja .done                      ; вне таблицы - клавиша без ASCII, игнорируем
+
+    xor bh, bh
+    mov bl, al
+    cmp byte [ss:RAM_KBD_SHIFT], 0
+    jne .use_shifted
+    mov ah, [cs:kbd_ascii_lo+bx]
+    jmp .have_char
+.use_shifted:
+    mov ah, [cs:kbd_ascii_hi+bx]
+.have_char:
+    cmp ah, 0
+    je .done                       ; в таблице пусто - непечатаемая клавиша
+
+    mov byte [ss:RAM_KBD_PENDING_SCAN], al
+    mov byte [ss:RAM_KBD_PENDING_CHAR], ah
+    mov byte [ss:RAM_KBD_PENDING], 1
+    jmp .done
+
+.shift_press:
+    mov byte [ss:RAM_KBD_SHIFT], 1
+
+.done:
+    pop bx
+    pop ax
+    ret
+
+; Таблицы трансляции "сырого" Scan Set 2 make-кода (0x00-MAX_SCAN) в
+; ASCII. Индекс - сам скан-код; 0 = клавиша без ASCII-эквивалента.
+; Числовые коды вместо символьных литералов - там, где символ сам по
+; себе конфликтует с синтаксисом NASM (кавычки, обратный слэш): 8=BS,
+; 9=TAB, 13=CR(Enter), 27=ESC, 34=", 39=', 59=;, 92=\.
+MAX_SCAN equ 0x76
+
+kbd_ascii_lo:
+    db 0,0,0,0,0,0,0,0,0,0,0,0,0,9,96,0                          ; 0x00-0x0F
+    db 0,0,0,0,0,'q','1',0,0,0,'z','s','a','w','2',0             ; 0x10-0x1F
+    db 0,'c','x','d','e','4','3',0,0,' ','v','f','t','r','5',0   ; 0x20-0x2F
+    db 0,'n','b','h','g','y','6',0,0,0,'m','j','u','7','8',0     ; 0x30-0x3F
+    db 0,',','k','i','o','0','9',0,0,'.','/','l',59,'p','-',0    ; 0x40-0x4F
+    db 0,0,39,0,'[','=',0,0,0,0,13,']',0,92,0,0                  ; 0x50-0x5F
+    db 0,0,0,0,0,0,8,0,0,0,0,0,0,0,0,0                           ; 0x60-0x6F
+    db 0,0,0,0,0,0,27                                            ; 0x70-0x76
+
+kbd_ascii_hi:
+    db 0,0,0,0,0,0,0,0,0,0,0,0,0,9,126,0                         ; 0x00-0x0F
+    db 0,0,0,0,0,'Q','!',0,0,0,'Z','S','A','W','@',0             ; 0x10-0x1F
+    db 0,'C','X','D','E','$','#',0,0,' ','V','F','T','R','%',0   ; 0x20-0x2F
+    db 0,'N','B','H','G','Y','^',0,0,0,'M','J','U','&','*',0     ; 0x30-0x3F
+    db 0,'<','K','I','O',')','(',0,0,'>','?','L',58,'P','_',0    ; 0x40-0x4F
+    db 0,0,34,0,'{','+',0,0,0,0,13,'}',0,124,0,0                 ; 0x50-0x5F
+    db 0,0,0,0,0,0,8,0,0,0,0,0,0,0,0,0                           ; 0x60-0x6F
+    db 0,0,0,0,0,0,27                                            ; 0x70-0x76
 
 ; Печать ASCIIZ-строки DS:SI на экран, поддерживает 13,10 (CR/LF).
 ; Управляется тумблером RAM_VGA_ON из setup-меню.

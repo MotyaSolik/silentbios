@@ -40,6 +40,11 @@ VGA screenshots along the way.
   (teletype output), `AH=0x00` (set video mode — mode `0x03` only),
   `AH=0x02`/`0x03` (set/get cursor position, including the real hardware
   CRTC cursor via ports `0x3D4`/`0x3D5`), and `AH=0x0F` (get video mode).
+- **A real `int 16h` handler** (keyboard services), decoding the same raw
+  Scan Set 2 polling used by the setup menu into ASCII, with Shift support.
+  `AH=0x00` reads a character (blocking), `AH=0x01` checks for one without
+  consuming it (non-blocking, reports through `ZF`). Numpad, function keys,
+  and other non-ASCII keys are silently ignored.
 
 ## Layout
 
@@ -97,12 +102,25 @@ source:
 - **There's no `int 13h` to call** — we *are* the BIOS, so disk access
   (`ata_read_mbr`) talks to the ATA controller ports directly instead of
   going through a software interrupt.
+- **`int 16h` `AH=0x01` returns its result through the `ZF` flag** — but
+  `iret` restores `FLAGS` from what the CPU pushed onto the stack when
+  `int 16h` was invoked, not from the live flags register. So the ISR
+  patches that stacked `FLAGS` word directly (bit 6) right before `iret`.
+  Get the polarity backwards here and everything *looks* like it's working
+  (characters decode correctly) while the caller's `jz`/`jnz` reads the
+  opposite of reality — this exact bug shipped once and was only caught by
+  dumping raw register/flag values over serial, not by reading the code.
 
 ## Known limitations
 
 - The `int 10h` handler supports `AH=0x0E`, `AH=0x00` (mode `0x03` only —
   other mode numbers are silently ignored), `AH=0x02`/`0x03`, and `AH=0x0F`.
   Other video functions are silently ignored.
+- The `int 16h` handler only supports `AH=0x00`/`0x01`, and only produces
+  ASCII for the main alphanumeric block (no numpad, function keys, or other
+  non-ASCII keys). Extended (`E0`-prefixed) keys are skipped rather than
+  decoded, which means an extended key can alias a numpad key with the same
+  trailing scan code — accepted as a simplification, not fixed.
 - Disk boot only reads LBA sector 0 (the MBR) — no partition table parsing.
 - The keyboard is read by polling, not IRQ/PIC-driven — fine for a setup
   menu, not enough for a real multitasking OS.

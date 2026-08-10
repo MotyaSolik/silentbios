@@ -33,8 +33,8 @@ start:
     call print_string
 
     ; --- Тест AH=0x03: читаем текущую позицию курсора и печатаем её
-    ; как десятичные числа - после строки выше курсор должен стоять
-    ; на той же строке (5), в колонке 10+длина(msg_at_cursor).
+    ; как десятичные числа (row,col - должны отражать, где реально
+    ; остановился курсор после печати строки выше).
     mov si, msg_cursor_label
     call print_string
     mov ah, 0x03
@@ -65,21 +65,54 @@ start:
     mov si, crlf
     call print_string
 
-    mov si, msg_prompt
+    ; --- Тест int 16h AH=0x00: блокирующее чтение символа (3 раза),
+    ; каждый раз эхо через int 10h AH=0x0E. Проверяет и саму трансляцию
+    ; Scan Set 2 -> ASCII, и учёт состояния Shift.
+    mov si, msg_kbd1
+    call print_string
+    mov ah, 0x00
+    int 0x16
+    call print_char_al
+    mov ah, 0x00
+    int 0x16
+    call print_char_al
+    mov ah, 0x00
+    int 0x16
+    call print_char_al
+    mov si, crlf
     call print_string
 
-    ; --- Ожидание символа из COM1 (для автоматизации через -serial stdio) ---
-.wait_serial:
-    mov dx, 0x3FD               ; Регистр статуса линии (LSR) для COM1
-    in al, dx
-    test al, 0x01                ; Data Ready?
-    jz .wait_serial
-
-    mov dx, 0x3F8
-    in al, dx                    ; читаем и сбрасываем принятый байт
-
-    mov si, msg_ok
+    ; --- Тест int 16h AH=0x01: неблокирующая проверка. Ждём клавишу
+    ; поллингом AH=0x01 (сам по себе демонстрирует неблокирующее ZF),
+    ; затем дважды "подсматриваем" (peek) - оба раза должен быть один
+    ; и тот же символ, т.к. AH=0x01 не потребляет клавишу. Потом
+    ; потребляем через AH=0x00 (тот же символ) и проверяем, что после
+    ; этого AH=0x01 честно говорит "клавиш нет" (ZF=1).
+    mov si, msg_kbd2
     call print_string
+.wait_peek:
+    mov ah, 0x01
+    int 0x16
+    jz .wait_peek
+
+    call print_char_al           ; peek #1
+    mov ah, 0x01
+    int 0x16
+    call print_char_al           ; peek #2 - должен совпасть с #1
+
+    mov ah, 0x00
+    int 0x16
+    call print_char_al           ; потребили - тот же символ
+
+    mov ah, 0x01
+    int 0x16
+    jz .empty_ok
+    mov al, 'X'                  ; БАГ: клавиша всё ещё "висит" после потребления
+    jmp .empty_print
+.empty_ok:
+    mov al, 'E'                  ; OK: после потребления буфер пуст
+.empty_print:
+    call print_char_al
 
 .halt:
     hlt
@@ -97,6 +130,12 @@ print_string:
     int 0x10
     jmp .loop
 .done:
+    ret
+
+; Печатает один символ из AL через int 10h AH=0x0E
+print_char_al:
+    mov ah, 0x0E
+    int 0x10
     ret
 
 ; Печатает AL (0-255) как десятичное число через int 10h AH=0x0E
@@ -133,15 +172,15 @@ print_dec_al:
     ret
 
 ; Данные
-msg_mode_ok:      db "AH=0x00 set mode 3: OK (screen cleared)", 13, 10, 0
-msg_at_cursor:    db "<-- printed via AH=0x02+0x0E", 0
-msg_cursor_label: db "AH=0x03 cursor row,col = ", 0
+msg_mode_ok:      db "M3clr", 13, 10, 0
+msg_at_cursor:    db "X02E", 0
+msg_cursor_label: db "cur=", 0
 msg_comma:        db ",", 0
-msg_mode_label:   db "AH=0x0F mode = ", 0
-msg_cols_label:   db ", cols = ", 0
+msg_mode_label:   db "mode=", 0
+msg_cols_label:   db ",cols=", 0
 crlf:             db 13, 10, 0
-msg_prompt:       db "Press ANY key (IN TERMINAL) to continue...", 13, 10, 0
-msg_ok:           db 13, 10, "Success! System unhalted.", 13, 10, 0
+msg_kbd1:         db "K00:", 0
+msg_kbd2:         db 13, 10, "K01:", 0
 
 times 510-($-$$) db 0
 dw 0xAA55
