@@ -7,7 +7,10 @@ all: $(TARGET) boot.bin
 $(TARGET): bios.asm
 	nasm -f bin bios.asm -o $(TARGET)
 
-boot.bin: boot.asm
+stage2.bin: stage2.asm disklayout.inc
+	nasm -f bin stage2.asm -o stage2.bin
+
+boot.bin: boot.asm disklayout.inc stage2.bin
 	nasm -f bin boot.asm -o boot.bin
 
 
@@ -20,3 +23,4 @@ run_nhda: all
 clean:
 	rm -f $(TARGET)
 	rm -f boot.bin
+	rm -f stage2.bin

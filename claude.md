@@ -11,13 +11,28 @@ in as a legacy BIOS ROM (reset vector at the end jumps to the entry point).
 - `bios.asm` — the BIOS source (main file, ~2000+ lines)
 - `font.bin` — 8×16 bitmap font (256 chars × 16 bytes), pulled in via
   `incbin "font.bin"` at assembly time. Must sit next to `bios.asm`.
-- `boot.asm` / `boot.bin` — a 3-sector test disk image (MBR sector, 512
-  bytes, ends in `0x55AA`, tight on space — check remaining slack before
-  adding more test code to it; plus 2 appended data sectors with a known
-  text pattern, used by the `int 13h` read test) used to verify disk boot
-  and the `int 10h`/`int 16h`/`int 13h` handlers. Not part of the BIOS
-  itself, just a verification tool.
-- `Makefile` — build automation (inspect it, don't assume targets)
+- `boot.asm` — test disk, **stage 1**: the MBR sector (512 bytes, ends in
+  `0x55AA`, tight on space, though it barely does anything now - see
+  below). Prints one line, reads `stage2.bin` via `int 13h` `AH=0x02`,
+  jumps to it. `incbin "stage2.bin"` pads the rest of the file out to
+  `STAGE2_SECTORS` sectors, followed by 2 more sectors of known test data
+  (`disklayout.inc` has the exact sector numbers - keep both files
+  `%include`ing it rather than hardcoding sector numbers in two places).
+- `stage2.asm` / `stage2.bin` — test disk, **stage 2**: a verbose,
+  human-narrated walkthrough of `int 10h`/`int 16h`/`int 13h`, loaded at
+  `0x9000` by stage 1. This is where new interactive/manual tests belong -
+  it's not sector-size-constrained the way `boot.asm` is (just bump
+  `STAGE2_SECTORS` in `disklayout.inc` if it outgrows the reserved space -
+  `nasm` will fail loudly with a negative `times` if it does). Existed
+  because a human asked to actually *watch* the tests run and understand
+  the output at a glance, not just decode compact machine-checkable labels
+  like `K00:hI1` - see the git history for what that looked like before.
+- `disklayout.inc` — `STAGE2_SECTORS` / `DATA_SECTOR` `equ`s, `%include`d
+  by both `boot.asm` and `stage2.asm` so their sector numbers can't drift
+  out of sync with each other.
+- `Makefile` — build automation (inspect it, don't assume targets;
+  `stage2.bin` must be built before `boot.bin`, which `incbin`s it - the
+  Makefile already encodes that dependency, don't reorder it).
 - `README.md` / `README_ru.md` — project docs (EN/RU), already edited by
   hand — check these for the canonical feature list before writing new ones.
 
@@ -61,6 +76,16 @@ Please keep doing that. Specifically:
   — remember the BIOS always goes through the setup menu first (waits for
   Esc) before attempting to read the MBR, so `sendkey esc` is needed to
   reach the boot-attempt code path in an automated test.
+- **"The screen stopped updating" is not the same as "execution stopped."**
+  When a screenshot shows the same frame no matter how long you wait,
+  don't assume a hang/deadlock and start staring at the last `int` call
+  before the freeze - that's what the VGA-scroll bug looked like, and the
+  real cause (writes past row 24, off the visible 4000-byte text buffer)
+  was nowhere near where the "hang" appeared to be. Bisect for real: drop
+  a tiny serial-only checkpoint helper (wait-for-THRE, write one fixed
+  byte, no other state touched) at several points in the suspect code and
+  read the trail back - if the markers all fire in order, the CPU isn't
+  stuck, the *display* is lying to you.
 
 ## Architecture notes / non-obvious gotchas
 
@@ -83,6 +108,25 @@ Please keep doing that. Specifically:
   need a value out of DX/DL before a `mul`/`div`, extract it *first*. (This
   exact bug caused the setup menu to render at column 0 regardless of the
   requested column, early in the project.)
+- **The `print_string` helper in `boot.asm`/`stage2.asm` clobbers `BX`, not
+  just `AX`** — it unconditionally does `xor bh,bh` / `mov bl,0x07` at its
+  own top (leftover from modeling a real BIOS teletype call convention).
+  If you stash a value in `BX` to survive a `print_string` call in between
+  reading it and printing it, it's gone - use `CX` or `DX` instead (neither
+  is touched by `print_string`, `print_char_al`, or `print_dec_al`). This
+  bit twice while writing `stage2.asm`: once as silently-wrong displayed
+  numbers (`mode=0 cols=7` instead of `3`/`80`), once as a comparison
+  (`cmp bl,1`) that could never see the value it was supposed to see,
+  because `print_string` reset `bl` to `0x07` between the capture and the
+  check. Same root cause as the `mul`-clobbers-`DX` note above: know
+  exactly what a helper you're calling leaves alone before relying on it.
+- **`vga_char_out` scrolls now — it didn't used to.** Before this was
+  added, output that crossed row 24 just kept computing further offsets
+  and writing there, silently past the visible 4000-byte text buffer; see
+  the testing-methodology note above about how that surfaced ("hang" that
+  wasn't one). If you're touching cursor/newline logic, `vga_scroll_up` is
+  what makes the `.check_scroll` label after the newline math not
+  optional - don't route new newline-producing paths around it.
 - **The BIOS's own boot code can't call `int 13h`** — disk access from
   inside the BIOS itself (`ata_read_mbr`) still talks to the primary ATA
   controller ports (`0x1F0`–`0x1F7`) directly, PIO mode, LBA28, no
@@ -130,24 +174,20 @@ AH=0x00/0x01, `int 13h` AH=0x00/0x02/0x08).
 
 `int 10h` `AH=0x00` (set mode 3 only), `AH=0x02`/`0x03` (cursor, including
 the real hardware CRTC cursor via ports `0x3D4`/`0x3D5`), and `AH=0x0F`
-(get mode) are implemented and verified end-to-end in QEMU via a test in
-`boot.asm` (set mode 3 + clear, set cursor to row 5/col 10, print via
-AH=0x0E, read cursor back via AH=0x03 and print it, read mode+columns back
-via AH=0x0F and print those) — checked against a VGA screenshot, cursor
-math confirmed exactly. `RAM_VIDEO_MODE` (`0x050F`) holds the current mode
-for the get-mode call to report.
+(get mode) are implemented and verified end-to-end in QEMU — cursor math
+confirmed exactly against a VGA screenshot. `RAM_VIDEO_MODE` (`0x050F`)
+holds the current mode for the get-mode call to report.
 
 `int 16h` `AH=0x00` (blocking read) and `AH=0x01` (non-blocking check, peek
 - doesn't consume) are implemented and verified in QEMU, including Shift
-and the peek/consume distinction (`boot.asm`'s `K00`/`K01` sections, driven
-via monitor `sendkey`/`sendkey shift-x`). RAM state: `RAM_KBD_SHIFT`
-(`0x0510`), `RAM_KBD_PENDING`/`_CHAR`/`_SCAN` (`0x0511`-`0x0513`) hold a
-single-slot decoded-key buffer filled by `kbd_service`, which advances the
-same E0/F0 state machine as `setup_menu` one raw byte at a time (non-
-blocking). Only the main alphanumeric block has ASCII mappings
-(`kbd_ascii_lo`/`kbd_ascii_hi`, indices `0x00`-`MAX_SCAN`); numpad/function
-keys and extended (E0-prefixed) keys are silently unmapped, same philosophy
-as `int10h_isr`'s `.unsupported` path.
+and the peek/consume distinction, driven via monitor `sendkey`/`sendkey
+shift-x`. RAM state: `RAM_KBD_SHIFT` (`0x0510`), `RAM_KBD_PENDING`/`_CHAR`/
+`_SCAN` (`0x0511`-`0x0513`) hold a single-slot decoded-key buffer filled by
+`kbd_service`, which advances the same E0/F0 state machine as `setup_menu`
+one raw byte at a time (non-blocking). Only the main alphanumeric block has
+ASCII mappings (`kbd_ascii_lo`/`kbd_ascii_hi`, indices `0x00`-`MAX_SCAN`);
+numpad/function keys and extended (E0-prefixed) keys are silently
+unmapped, same philosophy as `int10h_isr`'s `.unsupported` path.
 
 `int 13h` `AH=0x00` (reset), `AH=0x02` (read sectors, CHS→LBA), and
 `AH=0x08` (get params) are implemented and verified: first via a dedicated
@@ -155,9 +195,8 @@ serial hex-dump test (CF/AL/AH/CH/CL/DH/DL for a success case, a
 multi-sector read across a sector boundary, and an induced "unsupported
 function" error) to catch a `patch_stack_cf` polarity bug *before* it
 could hide behind a plausible-looking screenshot (see the gotcha above) -
-none was found, everything was correct on the first pass this time - then
-end-to-end in `boot.asm` (`13/08`/`13/02` sections) with a VGA screenshot.
-CHS→LBA uses a fixed, unqueried `SPT=63`/`HPC=16` geometry (`equ`s in
+none was found, everything was correct on the first pass this time. CHS→
+LBA uses a fixed, unqueried `SPT=63`/`HPC=16` geometry (`equ`s in
 `bios.asm`) since there's no `IDENTIFY DEVICE`; sectors are read one at a
 time, looping the same wait-BSY/wait-DRQ/transfer-256-words protocol as
 `ata_read_mbr` rather than relying on the controller to deliver a
@@ -165,6 +204,17 @@ multi-sector burst without re-checking DRQ. Unsupported functions
 explicitly set `CF=1`/`AH=1` (unlike `int10h`/`int16h`'s silent no-op) -
 for disk I/O, silently claiming success when nothing happened is worse
 than an honest error.
+
+The test disk (`boot.asm`+`stage2.asm`) is a real two-stage loader now,
+not one packed sector: stage 1 reads stage 2 via `int 13h` `AH=0x02` and
+jumps to it, which is both a demonstration of that call and the reason
+`stage2.asm` can afford verbose, narrated output instead of compact
+machine-checkable labels. All three interrupts get exercised end-to-end
+this way with a VGA screenshot, plus live `sendkey`/`sendkey shift-x`
+keyboard input for the `int 16h` section. `vga_char_out` gained scrolling
+(`vga_scroll_up`) specifically because this longer test overran 25 rows -
+see the gotchas above for both that and the `print_string`-clobbers-`BX`
+bug that showed up while writing it.
 
 ## Style/conventions to keep
 

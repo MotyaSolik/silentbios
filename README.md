@@ -20,7 +20,9 @@ VGA screenshots along the way.
   Graphics Controller, Attribute Controller, and DAC palette are all
   programmed directly, since there's no video BIOS/option ROM to do it for
   us. The 8×16 bitmap font is generated and shipped as a separate binary
-  (`font.bin`), pulled in at assembly time via `incbin`.
+  (`font.bin`), pulled in at assembly time via `incbin`. Output past the
+  last row scrolls the screen up a line rather than running off the
+  visible buffer.
 - **POST diagnostics**: a conventional-memory test (0–640 KB, in 64 KB
   blocks) and an 8042 keyboard-controller self-test (command `0xAA`).
 - **Interactive setup menu** — arrow keys / Enter / Esc, keyboard read by
@@ -61,7 +63,9 @@ VGA screenshots along the way.
 | `bios.asm` | BIOS source |
 | `font.bin` | 8×16 bitmap font (256 chars × 16 bytes), pulled in via `incbin` |
 | `sbios.bin` | Prebuilt image, 65536 bytes |
-| `boot.asm` / `boot.bin` | A 3-sector test disk image (MBR + 2 data sectors) used to verify disk boot and `int 10h`/`int 16h`/`int 13h` — not part of the BIOS itself, just a verification tool |
+| `boot.asm` / `boot.bin` | Test disk image, stage 1: the MBR sector. A minimal loader — prints a line, then reads `stage2.bin` off the disk via `int 13h` `AH=0x02` and jumps to it. Not part of the BIOS itself. |
+| `stage2.asm` / `stage2.bin` | Test disk image, stage 2: a human-readable, narrated walkthrough of `int 10h`/`int 16h`/`int 13h` (loaded by stage 1, doesn't fit in one sector). `boot.bin` embeds it via `incbin` plus 2 more data sectors — run `make run` and read the screen. |
+| `disklayout.inc` | Shared sector-layout constants (`%include`d by both `boot.asm` and `stage2.asm`) so the two files' sector numbers can't drift apart. |
 | `README_ru.md` | README on russian |
 
 ## Building
@@ -87,6 +91,11 @@ make run
 In the setup menu: Up/Down navigates, Enter toggles the selected item (or
 exits, on the Exit item), Esc exits setup and continues the normal boot
 sequence (the disk MBR read).
+
+After Esc, `make run` boots the test disk, which prints a plain-language,
+step-by-step narration of every `int 10h`/`int 16h`/`int 13h` call it
+makes (`stage2.asm`) — type a few keys when it asks, and read the `-> OK`
+lines to see what's actually being exercised.
 
 ## Design notes
 
@@ -129,6 +138,16 @@ source:
   For video/keyboard, silently doing nothing is the safer default; for
   disk I/O, silently claiming success when nothing happened is worse than
   an honest error — the caller might act on data that was never read.
+- **Text past the last row used to just vanish.** `vga_char_out`'s newline
+  handler only ever computed the *next* row's offset — nothing stopped it
+  from computing a position past row 24 and writing there anyway, off the
+  visible 4000-byte text buffer. Harmless while every screen fit in 25
+  lines (POST, the setup menu); surfaced as soon as a longer test program
+  printed more than that — the display appeared to hang, but the CPU kept
+  running fine (confirmed with a serial checkpoint trail showing execution
+  sailing straight through to completion while the screen stayed frozen).
+  Fixed with a `vga_scroll_up` that the write path calls once the cursor
+  would cross row 25: copy rows 1–24 up into 0–23, blank the new row 24.
 
 ## Known limitations
 

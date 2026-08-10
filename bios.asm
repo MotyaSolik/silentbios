@@ -679,7 +679,7 @@ vga_char_out:
     mov byte [es:bx], 0x07
     inc bx
     mov [ss:RAM_VGA_POS], bx
-    jmp .done
+    jmp .check_scroll
 
 .newline:
     mov bx, [ss:RAM_VGA_POS]
@@ -691,11 +691,60 @@ vga_char_out:
     mul cx                   ; ax = ax * 160 = начало следующей строки
     mov [ss:RAM_VGA_POS], ax
 
+.check_scroll:
+    ; курсор ушёл за последнюю строку (25*160=4000)? Без этой проверки
+    ; длинный вывод молча "утекает" за пределы видимого буфера - экран
+    ; выглядит зависшим, хотя код продолжает работать (так был найден
+    ; этот баг: длинный человекочитаемый тест перестал что-либо рисовать
+    ; примерно на середине).
+    cmp word [ss:RAM_VGA_POS], 4000
+    jb .done
+    call vga_scroll_up
+    mov word [ss:RAM_VGA_POS], 3840          ; начало последней строки (24*160)
+
 .done:
     pop es
     pop dx
     pop cx
     pop bx
+    pop ax
+    ret
+
+; Прокручивает текстовый экран на одну строку вверх: строки 1-24
+; копируются в 0-23 (3840 байт = 24*160), освободившаяся строка 24
+; заливается пробелами (атрибут 0x07). Вызывается из vga_char_out,
+; когда курсор пытается уйти за последнюю строку.
+vga_scroll_up:
+    push ax
+    push cx
+    push si
+    push di
+    push es
+    push ds
+
+    cld
+
+    mov ax, 0xB800
+    mov es, ax
+    mov ds, ax
+
+    xor si, si
+    add si, 160           ; источник - начало строки 1
+    xor di, di              ; назначение - начало строки 0
+    mov cx, 3840              ; байт для переноса (24 строки * 160)
+    rep movsb
+
+    mov cx, 80                  ; di сейчас = 3840 (начало строки 24) -
+.clear_loop:                     ; заливаем её пробелами
+    mov word [es:di], 0x0720
+    add di, 2
+    loop .clear_loop
+
+    pop ds
+    pop es
+    pop di
+    pop si
+    pop cx
     pop ax
     ret
 
