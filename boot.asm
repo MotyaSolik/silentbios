@@ -113,6 +113,58 @@ start:
     mov al, 'E'                  ; OK: после потребления буфер пуст
 .empty_print:
     call print_char_al
+    mov si, crlf
+    call print_string
+
+    ; --- Тест int 13h AH=0x08: параметры диска (макс.головка, SPT) ---
+    mov si, msg13_params
+    call print_string
+    mov ah, 0x08
+    mov dl, 0x80
+    int 0x13
+    mov al, dh
+    call print_dec_al
+    mov si, msg_comma
+    call print_string
+    mov al, cl
+    and al, 0x3F
+    call print_dec_al
+    mov si, crlf
+    call print_string
+
+    ; --- Тест int 13h AH=0x02: читаем 2 сектора (CHS 0,0,2) в 0x8000 -
+    ; сектора 2 и 3 на диске несут известный текстовый паттерн (см.
+    ; конец файла), печатаем их обратно, чтобы сверить содержимое.
+    mov si, msg13_read
+    call print_string
+    mov ax, 0x0202
+    mov ch, 0
+    mov cl, 2
+    mov dh, 0
+    mov dl, 0x80
+    mov bx, 0x8000
+    int 0x13
+    call print_dec_al             ; AL = число реально прочитанных секторов
+    mov si, crlf
+    call print_string
+
+    mov si, 0x8000
+    mov cx, 19
+.p13_1:
+    lodsb
+    call print_char_al
+    loop .p13_1
+    mov si, crlf
+    call print_string
+
+    mov si, 0x8200
+    mov cx, 19
+.p13_2:
+    lodsb
+    call print_char_al
+    loop .p13_2
+    mov si, crlf
+    call print_string
 
 .halt:
     hlt
@@ -181,6 +233,19 @@ msg_cols_label:   db ",cols=", 0
 crlf:             db 13, 10, 0
 msg_kbd1:         db "K00:", 0
 msg_kbd2:         db 13, 10, "K01:", 0
+msg13_params:     db "13/08 hd,spt=", 0
+msg13_read:       db "13/02 read=", 0
 
 times 510-($-$$) db 0
 dw 0xAA55
+
+; --- Секторы 2 и 3 диска (LBA=1,2) - известный текстовый паттерн для
+; проверки int 13h AH=0x02 (не часть загружаемого кода - обычный
+; загрузчик их сюда не положит, это только для теста). ---
+sector2_data:
+db "SECTOR2-DATA-OK!!!!"
+times 512-($-sector2_data) db 0x00
+
+sector3_data:
+db "SECTOR3-DATA-OK!!!!"
+times 512-($-sector3_data) db 0x00

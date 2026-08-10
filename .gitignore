@@ -1,3 +1,4 @@
 boot.bin
 sbios.bin
 qemu.log
+.claude/

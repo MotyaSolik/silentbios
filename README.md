@@ -45,6 +45,14 @@ VGA screenshots along the way.
   `AH=0x00` reads a character (blocking), `AH=0x01` checks for one without
   consuming it (non-blocking, reports through `ZF`). Numpad, function keys,
   and other non-ASCII keys are silently ignored.
+- **A real `int 13h` handler** (disk services), so loaded bootloaders/OSes
+  can read more than just the MBR without talking to the ATA controller
+  themselves. `AH=0x00` (reset), `AH=0x02` (read sectors, CHS — translated
+  to LBA28 against an assumed `63 sectors/track, 16 heads` geometry, since
+  there's no `IDENTIFY DEVICE`), `AH=0x08` (get drive parameters). Reports
+  errors honestly: an unsupported function returns `CF=1`/`AH=1` rather than
+  silently claiming success, since for disk I/O that's more dangerous than
+  for video/keyboard.
 
 ## Layout
 
@@ -53,7 +61,7 @@ VGA screenshots along the way.
 | `bios.asm` | BIOS source |
 | `font.bin` | 8×16 bitmap font (256 chars × 16 bytes), pulled in via `incbin` |
 | `sbios.bin` | Prebuilt image, 65536 bytes |
-| `boot.asm` / `boot.bin` | A tiny test MBR used to verify disk boot and `int 10h` — not part of the BIOS itself, just a verification tool |
+| `boot.asm` / `boot.bin` | A 3-sector test disk image (MBR + 2 data sectors) used to verify disk boot and `int 10h`/`int 16h`/`int 13h` — not part of the BIOS itself, just a verification tool |
 | `README_ru.md` | README on russian |
 
 ## Building
@@ -99,17 +107,28 @@ source:
   empirically, not assumed from documentation. The key-handling code
   accounts for that, plus the fact that a key's "release" code (`F0 xx`)
   ends in the same byte as its "press" code.
-- **There's no `int 13h` to call** — we *are* the BIOS, so disk access
-  (`ata_read_mbr`) talks to the ATA controller ports directly instead of
-  going through a software interrupt.
-- **`int 16h` `AH=0x01` returns its result through the `ZF` flag** — but
-  `iret` restores `FLAGS` from what the CPU pushed onto the stack when
-  `int 16h` was invoked, not from the live flags register. So the ISR
-  patches that stacked `FLAGS` word directly (bit 6) right before `iret`.
-  Get the polarity backwards here and everything *looks* like it's working
-  (characters decode correctly) while the caller's `jz`/`jnz` reads the
-  opposite of reality — this exact bug shipped once and was only caught by
-  dumping raw register/flag values over serial, not by reading the code.
+- **The BIOS's own boot code can't call `int 13h`** — it's the thing
+  *providing* that service, not consuming it, so its own MBR read
+  (`ata_read_mbr`) still talks to the ATA controller ports directly.
+  Loaded code (a bootloader, a second stage, an OS) *can* call `int 13h`,
+  same as it would on real hardware.
+- **`int 16h` `AH=0x01` and `int 13h` (`AH=0x00`/`0x02`/`0x08`) return
+  their result through a flag** (`ZF` / `CF`) — but `iret` restores `FLAGS`
+  from what the CPU pushed onto the stack when the interrupt was invoked,
+  not from the live flags register. So the ISR patches that stacked
+  `FLAGS` word directly right before `iret` (a small shared helper,
+  `patch_stack_cf`, does this for all three `int 13h` functions). Get the
+  polarity backwards here and everything *looks* like it's working
+  (characters/data decode correctly) while the caller's `jz`/`jnz`/`jc`
+  reads the opposite of reality — this exact bug shipped once for `int
+  16h` and was only caught by dumping raw register/flag values over
+  serial, not by reading the code. `int 13h` was designed with that
+  lesson in mind and verified the same way before trusting a screenshot.
+- **Unsupported `int 13h` functions report `CF=1`/`AH=1` explicitly**,
+  unlike `int 10h`/`int 16h`'s silent no-op for anything unrecognized.
+  For video/keyboard, silently doing nothing is the safer default; for
+  disk I/O, silently claiming success when nothing happened is worse than
+  an honest error — the caller might act on data that was never read.
 
 ## Known limitations
 
@@ -121,7 +140,14 @@ source:
   non-ASCII keys). Extended (`E0`-prefixed) keys are skipped rather than
   decoded, which means an extended key can alias a numpad key with the same
   trailing scan code — accepted as a simplification, not fixed.
-- Disk boot only reads LBA sector 0 (the MBR) — no partition table parsing.
+- The `int 13h` handler supports `AH=0x00`/`0x02`/`0x08` only, translates
+  CHS to LBA against an assumed (not queried) `63/16` sectors-per-track/
+  heads geometry, and doesn't implement `IDENTIFY DEVICE` — `AH=0x08`
+  always reports a generic maximum-cylinder value regardless of the actual
+  disk image size. Sectors are read one at a time (no true multi-sector
+  burst transfer), which is simpler and more robust but slower.
+- Disk boot (the BIOS's own MBR load) only reads LBA sector 0 — no
+  partition table parsing.
 - The keyboard is read by polling, not IRQ/PIC-driven — fine for a setup
   menu, not enough for a real multitasking OS.
 - A signed "debug key" / HWID-unlock scheme was considered and deliberately

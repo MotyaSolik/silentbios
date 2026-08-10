@@ -59,6 +59,13 @@ start:
     ; прямого поллинга портов 0x60/0x64, как это делает настоящий BIOS.
     call install_int16h_vector
 
+    ; Аналогично - int 13h (дисковые сервисы), вектор 0x13*4.
+    ; Загруженный код может читать диск через "int 13h" вместо
+    ; прямого поллинга ATA-портов, как это делает настоящий BIOS
+    ; (сама BIOS по-прежнему читает MBR напрямую через ata_read_mbr -
+    ; у неё самой int 13h взять неоткуда).
+    call install_int13h_vector
+
     call init_serial
 
     mov si, msg_banner
@@ -1328,6 +1335,346 @@ setup_menu:
     call vga_print_at
 
     pop ax
+    ret
+
+; =========================================================
+; int 13h - дисковые сервисы. Поддерживаются:
+;   AH=0x00 - сброс контроллера (DL=диск, игнорируем - у нас один)
+;   AH=0x02 - чтение секторов по CHS (-> данные в ES:BX)
+;   AH=0x08 - параметры диска (геометрия)
+; Прочие функции явно сигнализируют ошибку (CF=1, AH=1) - в отличие
+; от int10h/int16h, для дисковых операций тихо промолчать об успехе
+; там, где на самом деле ничего не произошло, опаснее, чем явно
+; сказать "не поддерживается": вызывающий код может решить, что
+; запись/чтение прошли успешно, и продолжить работать с мусором.
+;
+; У нас нет IDENTIFY DEVICE, поэтому настоящей геометрии диска мы не
+; знаем - CHS транслируется в LBA по условной геометрии SPT=63/
+; HPC=16 (тот же компромисс, что и у многих учебных BIOS). AH=0x08
+; репортит "классический" максимум цилиндра (1023) вне зависимости
+; от реального размера образа диска - реальная граница всё равно
+; определяется тем, что фактически лежит на диске (ATA просто
+; вернёт ошибку/мусор при выходе за его пределы).
+;
+; Регистровая конвенция - та же, что у int10h/int16h: ISR сохраняет
+; только ds/es/si/di/bp, каждая функция сама решает, что ей нужно.
+; Особый случай - CF: как и AH=0x01 у int16h (см. её комментарий),
+; результат нужно вернуть через флаг, а iret восстанавливает FLAGS
+; из стека (то, что запушил сам "int"), а не из текущего регистра -
+; поэтому используется общий patch_stack_cf, вызываемый СРАЗУ после
+; обработчика функции, по сигналу в BL (0=CF снять, иначе=CF
+; выставить). BL/CX/DX (а для read - ещё и AL/AH сверх официального
+; вывода) не сохраняются - не задокументированный вывод для этих
+; функций.
+; =========================================================
+install_int13h_vector:
+    push ax
+    push es
+
+    xor ax, ax
+    mov es, ax
+    mov word [es:0x13*4], int13h_isr
+    mov word [es:0x13*4+2], cs
+
+    pop es
+    pop ax
+    ret
+
+int13h_isr:
+    push si
+    push di
+    push bp
+    push ds
+    push es
+
+    cmp ah, 0x00
+    je .fn_00
+    cmp ah, 0x02
+    je .fn_02
+    cmp ah, 0x08
+    je .fn_08
+
+    ; неподдерживаемая функция - явно сигнализируем ошибку (см.
+    ; обоснование в комментарии к блоку выше)
+    pop es
+    pop ds
+    pop bp
+    pop di
+    pop si
+    mov ah, 1
+    mov bl, 1
+    call patch_stack_cf
+    iret
+
+.fn_00:
+    pop es
+    pop ds
+    pop bp
+    pop di
+    pop si
+    call int13h_reset
+    call patch_stack_cf
+    iret
+
+.fn_02:
+    pop es
+    pop ds
+    pop bp
+    pop di
+    pop si
+    call int13h_read_sectors
+    call patch_stack_cf
+    iret
+
+.fn_08:
+    pop es
+    pop ds
+    pop bp
+    pop di
+    pop si
+    call int13h_get_params
+    call patch_stack_cf
+    iret
+
+; Патчит бит CF (бит 0) младшего байта FLAGS, лежащего в стеке чуть
+; выше нашего собственного возвратного адреса - вызывать СРАЗУ после
+; того, как обработчик функции отработал и стек уже "чист" (см.
+; int13h_isr .fn_XX, где si/di/bp/ds/es уже выкинуты до вызова).
+; Вход: BL=0 -> CF=0 (успех), любое ненулевое BL -> CF=1 (ошибка).
+; Тот же приём и то же предупреждение про полярность, что у AH=0x01
+; в int16h_isr - перепутать 0/1 здесь легко и незаметно.
+patch_stack_cf:
+    and bl, 1
+    push bp
+    mov bp, sp
+    ; [bp+0]=наш push bp, [bp+2]=наш возвратный адрес (call),
+    ; [bp+4]=IP(оригинал), [bp+6]=CS(оригинал), [bp+8]=младший байт
+    ; FLAGS(оригинал, в нём и лежит CF - бит 0)
+    mov bh, [ss:bp+8]
+    and bh, 0xFE
+    or bh, bl
+    mov [ss:bp+8], bh
+    pop bp
+    ret
+
+; int 13h AH=0x00 - сброс контроллера. DL=диск (игнорируем - у нас
+; один). Пульс SRST через Device Control Register (0x3F6, бит 2),
+; затем ждём BSY=0 на статусном порту. Порт 0x80 (POST-диагностика)
+; используется как дешёвая задержка на несколько шин-циклов - запись
+; в него ни на что не влияет, кроме времени выполнения.
+; Выход: AH=код статуса (0=OK), BL=0/1 для patch_stack_cf.
+int13h_reset:
+    push cx
+    push dx
+
+    mov dx, 0x3F6
+    mov al, 0x04              ; SRST=1
+    out dx, al
+
+    mov cx, 4
+.srst_delay:
+    out 0x80, al
+    loop .srst_delay
+
+    xor al, al                 ; SRST=0
+    out dx, al
+
+    mov dx, 0x1F7
+    mov cx, 0xFFFF
+.wait_ready:
+    in al, dx
+    test al, 0x80                ; BSY?
+    jz .ok
+    loop .wait_ready
+
+    mov ah, 1                     ; таймаут - статус "ошибка"
+    mov bl, 1
+    jmp .done
+.ok:
+    xor ah, ah
+    xor bl, bl
+.done:
+    pop dx
+    pop cx
+    ret
+
+; int 13h AH=0x08 - параметры диска. Вход: DL=диск (игнорируем).
+; Выход: CH=младшие 8 бит макс.цилиндра, CL: биты0-5=SPT,
+; биты6-7=старшие 2 бита макс.цилиндра; DH=макс.головка (HPC-1);
+; DL=число дисков (1); AH=0. ES:DI (указатель на drive parameter
+; table) не трогаем - большинство вызывающих читают геометрию через
+; CH/CL/DH и не разыменовывают этот указатель.
+MAX_CYL equ 1023
+
+int13h_get_params:
+    mov ch, MAX_CYL & 0xFF
+    mov cl, (MAX_CYL >> 8) & 0x03
+    shl cl, 6
+    or cl, SPT
+    mov dh, HPC - 1
+    mov dl, 1
+    xor ah, ah
+    xor bl, bl
+    ret
+
+; int 13h AH=0x02 - чтение секторов (CHS). Вход: AL=число секторов
+; (0 трактуется как 1 - полный диапазон 256 нашим крошечным тестовым
+; образам не нужен), CH=цилиндр(биты0-7), CL: биты0-5=сектор(1-63),
+; биты6-7=биты8-9 цилиндра, DH=головка, DL=диск (игнорируем),
+; ES:BX=буфер назначения. LBA считается 32-битно (dx:ax), но на
+; порты уходят только младшие 28 бит - тот же протокол, что и в
+; ata_read_mbr. Секторы читаются по одному (не пачкой) - проще и
+; надёжнее ждать DRQ перед каждым, чем полагаться на то, что
+; контроллер сам не потребует этого между секторами при multi-sector
+; READ.
+; Выход: AL=число реально прочитанных секторов, AH=код статуса,
+; BL=0/1 для patch_stack_cf.
+;
+; Распределение регистров внутри функции (пояснение, т.к. регистров
+; впритык): di - буфер назначения (offset, захватывается из BX
+; СРАЗУ на входе, дальше bx свободен); si - сектор-1, потом счётчик
+; прочитанных секторов; bp - цилиндр, потом временный перенос при
+; умножении, потом запрошенное число секторов; cx - LBA биты 0-15
+; (cl/ch), bx - LBA биты 16-31 (bl/bh, реально нужны только 16-27).
+SPT equ 63
+HPC equ 16
+
+int13h_read_sectors:
+    push si
+    push di
+    push bp
+
+    mov di, bx                  ; di = буфер назначения (offset) - ES не
+                                   ; трогаем, он уже = ES вызывающего кода
+
+    push ax                       ; сохраняем запрошенное число секторов (AL)
+
+    ; --- вытаскиваем составляющие CHS в безопасные регистры ДО
+    ; каких-либо умножений (mul портит весь DX) ---
+    xor ah, ah
+    mov al, dh
+    mov bx, ax                     ; bx = голова (временно, до вычисления LBA)
+
+    mov al, cl
+    and al, 0x3F
+    dec al
+    xor ah, ah
+    mov si, ax                      ; si = сектор-1 (временно)
+
+    mov al, cl
+    shr al, 6
+    xor ah, ah
+    mov bp, ax
+    mov al, ch
+    xor ah, ah
+    shl bp, 8
+    or bp, ax                        ; bp = цилиндр (временно)
+
+    ; --- LBA (32 бита, dx:ax) = (cylinder*HPC + head) * SPT + (sector-1) ---
+    mov ax, bp
+    mov cx, HPC
+    mul cx                             ; dx:ax = cylinder*HPC
+    add ax, bx                          ; + голова (пока ещё в bx)
+    adc dx, 0
+    mov cx, SPT
+    push ax
+    mov ax, dx
+    mul cx
+    mov bp, ax                            ; bp = перенос (старшая часть) - временно
+    pop ax
+    mul cx
+    add dx, bp
+    add ax, si
+    adc dx, 0
+    ; dx:ax = LBA (32 бита)
+
+    ; --- раскладываем LBA по байтам: cx = биты0-15, bx = биты16-31 ---
+    mov cx, ax
+    mov bx, dx
+
+    pop ax                                  ; восстанавливаем запрошенное число секторов
+    xor ah, ah
+    or al, al
+    jnz .have_count
+    mov al, 1
+.have_count:
+    mov bp, ax                                ; bp = запрошенное число секторов
+
+    xor si, si                                  ; si = сколько секторов уже прочитано
+
+.sector_loop:
+    cmp si, bp
+    jae .all_done
+
+    mov dx, 0x1F6
+    mov al, bh
+    and al, 0x0F                                  ; биты 24-27 LBA
+    or al, 0xE0                                     ; master + LBA-режим
+    out dx, al
+
+    mov dx, 0x1F2
+    mov al, 1
+    out dx, al
+
+    mov dx, 0x1F3
+    mov al, cl
+    out dx, al
+    mov dx, 0x1F4
+    mov al, ch
+    out dx, al
+    mov dx, 0x1F5
+    mov al, bl
+    out dx, al
+
+    mov dx, 0x1F7
+    mov al, 0x20                                     ; READ SECTORS
+    out dx, al
+
+    push cx
+    mov cx, 0xFFFF
+.wait_drq:
+    in al, dx
+    test al, 0x80                                       ; BSY?
+    jnz .wdrq_next
+    test al, 0x08                                         ; DRQ?
+    jnz .wdrq_ok
+.wdrq_next:
+    loop .wait_drq
+    pop cx
+    jmp .read_fail
+.wdrq_ok:
+    pop cx
+
+    mov dx, 0x1F0
+    push cx
+    mov cx, 256
+.xfer_loop:
+    in ax, dx
+    mov [es:di], ax
+    add di, 2
+    loop .xfer_loop
+    pop cx
+
+    add cx, 1                                               ; LBA++ (32-битно, cx:bx)
+    adc bx, 0
+
+    inc si
+    jmp .sector_loop
+
+.read_fail:
+    mov ax, si                                                ; al = сколько успели прочитать (ah тоже 0)
+    mov ah, 1                                                   ; статус - ошибка
+    mov bl, 1
+    jmp .exit
+
+.all_done:
+    mov ax, si                                                    ; al = число прочитанных, ah=0 (OK)
+    xor bl, bl
+
+.exit:
+    pop bp
+    pop di
+    pop si
     ret
 
 ; =========================================================
