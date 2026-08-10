@@ -1,0 +1,36 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nasm
+        run: sudo apt-get update && sudo apt-get install -y nasm
+
+      - name: Build
+        run: make all
+
+      - name: Check sbios.bin size (must be exactly 64 KB to work as a BIOS ROM)
+        run: |
+          size=$(stat -c%s sbios.bin)
+          if [ "$size" -ne 65536 ]; then
+            echo "sbios.bin is $size bytes, expected exactly 65536"
+            exit 1
+          fi
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: silentbios-build
+          path: |
+            sbios.bin
+            boot.bin
+            stage2.bin
