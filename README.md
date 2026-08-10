@@ -110,3 +110,7 @@ source:
   left out: the project is open source, and gating features behind an
   embedded secret doesn't hold up once the ROM can be disassembled — anyone
   can just pull the check out.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
