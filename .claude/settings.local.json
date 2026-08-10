@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(nasm -f bin bios.asm -o /tmp/claude-1000/-home-motts-sbios/01e65147-94a7-4909-8eb4-4911b81ef273/scratchpad/bios_test.bin)",
+      "Bash(nasm -f bin boot.asm -o /tmp/claude-1000/-home-motts-sbios/01e65147-94a7-4909-8eb4-4911b81ef273/scratchpad/boot_test.bin)"
+    ]
+  }
+}
