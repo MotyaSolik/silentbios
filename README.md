@@ -105,10 +105,18 @@ different names, and a second attached disk (`-hdb` in QEMU) was
 unreachable no matter which drive number addressed it. `int 13h AH=0x02`
 now sets the drive-select bit in port `0x1F6` based on `DL` (`0x80` /
 `DL<0x80` → master, `0x81` → slave — the primary channel's other drive,
-matching QEMU's `-hda`/`-hdb`; higher drive numbers, which would need a
-secondary ATA channel this project doesn't implement, quietly fall back
-to master). Verified with two attached disks carrying different known
-content at LBA 0 and reading both by `DL`.
+matching QEMU's `-hda`/`-hdb`). Verified with two attached disks carrying
+different known content at LBA 0 and reading both by `DL`.
+
+That alone didn't stop GRUB's `ls` from listing a dozen-plus phantom
+drives, though — every `int 13h` function still answered *success* for
+any `DL`, master/slave or not, so drive numbers we don't support looked
+just as "present" as the two real ones. `int13h_isr` now checks `DL`
+before dispatching to any function at all: only `DL<0x82` (floppy,
+master, or slave) get a real answer; anything else — a secondary ATA
+channel this project doesn't implement — honestly returns `CF=1` (drive
+not present), the same way real BIOSes signal "no such drive" during
+enumeration.
 
 ## Layout
 

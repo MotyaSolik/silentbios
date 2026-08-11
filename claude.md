@@ -386,6 +386,22 @@ instead (`bx` is free at that point - its only job so far was `mov di,
 bx` to capture the destination buffer offset) so it never touches the
 register the very next instruction needs intact.
 
+**That drivebit fix alone wasn't enough** - `ls` in GRUB still listed a
+dozen-plus phantom drives after it. Root cause: every `int 13h` function
+answered success (`CF=0`) for literally any `DL`, master/slave or not -
+the drivebit fix made `DL=0x81` reach a genuinely different physical
+disk, but `DL=0x82`, `0x83`, ... still "worked" too, just silently
+aliased back to master. GRUB's drive enumeration relies on *some*
+function - likely `AH=0x08` or `AH=0x41` - returning `CF=1` for a
+nonexistent drive to know when to stop probing; we never did. Fixed by
+checking `DL` once, in `int13h_isr`, before dispatching to any function
+at all (`cmp dl, 0x82` / `jb .drive_ok`, else fall into the exact same
+`CF=1`/`AH=1` tail already used for unsupported `AH` functions) - only
+`DL<0x82` (floppy geometry, master, or slave - everything this project's
+single ATA channel can actually reach) gets a real answer. Verified with
+a small test disk calling `AH=0x08` for `DL=0x80/0x81/0x82/0xFF` and
+checking `CF`: first two succeed, last two correctly fail.
+
 The test disk (`boot.asm`+`stage2.asm`) is a real two-stage loader now,
 not one packed sector: stage 1 reads stage 2 via `int 13h` `AH=0x02` and
 jumps to it, which is both a demonstration of that call and the reason

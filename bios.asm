@@ -1530,6 +1530,27 @@ int13h_isr:
     push ds
     push es
 
+    ; --- сначала проверяем DL, ДО диспетчеризации по AH: физически
+    ; мы умеем говорить только с master/slave primary ATA-канала
+    ; (DL<0x80 - floppy-геометрия, но физически те же порты, что и
+    ; master; DL=0x80 - master; DL=0x81 - slave). Для любого другого
+    ; DL честно отвечаем "такого диска нет" (CF=1), а не молча
+    ; успеваем на нём же master - иначе GRUB, перебирающая номера
+    ; дисков в поисках своего, решает, что у нас 16+ дисков (каждый
+    ; DL успешно отвечает). Раньше этой проверки не было вообще.
+    cmp dl, 0x82
+    jb .drive_ok
+    pop es
+    pop ds
+    pop bp
+    pop di
+    pop si
+    mov ah, 1
+    mov bl, 1
+    call patch_stack_cf
+    iret
+.drive_ok:
+
     cmp ah, 0x00
     je .fn_00
     cmp ah, 0x02
