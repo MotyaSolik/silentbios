@@ -97,6 +97,19 @@ mattered because GRUB trusts `AL` (ASCII) for regular typing but `AH`
 (scan code) to recognize special keys like Enter; letters worked long
 before Enter did.
 
+A fifth gap showed up chasing this further: `int 13h` always talked to
+the primary channel's *master* drive, no matter what `DL` asked for, so
+GRUB — which probes many possible BIOS drive numbers while looking for
+its own disk — saw the same physical disk echoed back under a dozen
+different names, and a second attached disk (`-hdb` in QEMU) was
+unreachable no matter which drive number addressed it. `int 13h AH=0x02`
+now sets the drive-select bit in port `0x1F6` based on `DL` (`0x80` /
+`DL<0x80` → master, `0x81` → slave — the primary channel's other drive,
+matching QEMU's `-hda`/`-hdb`; higher drive numbers, which would need a
+secondary ATA channel this project doesn't implement, quietly fall back
+to master). Verified with two attached disks carrying different known
+content at LBA 0 and reading both by `DL`.
+
 ## Layout
 
 | File | Purpose |

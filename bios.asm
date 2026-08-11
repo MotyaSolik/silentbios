@@ -33,6 +33,9 @@ RAM_GEOM_SPT equ 0x0514      ; byte: секторов/дорожку для ТЕ
 RAM_GEOM_HPC equ 0x0515      ; byte: головок для текущего вызова int 13h
 RAM_MEM_KB   equ 0x0516      ; word: объём conventional-памяти в KB, найденный
                               ; post_memory_test (для int 12h)
+RAM_GEOM_DRIVEBIT equ 0x0518 ; byte: бит выбора master/slave (0x1F6, бит4)
+                              ; для ТЕКУЩЕГО вызова int 13h AH=0x02 - как и
+                              ; RAM_GEOM_SPT/_HPC, не персистентно
 
 start:
     cli
@@ -1729,6 +1732,25 @@ int13h_read_sectors:
     mov byte [ss:RAM_GEOM_HPC], HPC_FLOPPY
 .geom_done:
 
+    ; --- master/slave по DL, ПОКА DL ещё цел (дальше в этой функции
+    ; будет mul, а он портит весь DX/DL - см. общий гоча-комментарий
+    ; про mul в начале файла). DL=0x80 и DL<0x80(floppy) -> master
+    ; (бит4=0); DL=0x81 -> slave (второй диск на ТОМ ЖЕ primary
+    ; ATA-канале 0x1F0-0x1F7, т.е. -hdb в QEMU). Другие DL (0x82+) не
+    ; поддерживаем - у нас нет secondary-канала (0x170-0x177), тихо
+    ; трактуем как master, тот же принцип, что и везде в проекте.
+    ; Раньше этого не было вообще - int13h всегда ходил на master,
+    ; из-за чего GRUB, перебирая номера дисков, видел один и тот же
+    ; физический диск под кучей разных "hdN".
+    xor bl, bl                      ; bx (не al!) - al ещё нужен целым для
+                                       ; входного числа секторов, его сохраняют
+                                       ; чуть ниже через push ax
+    cmp dl, 0x81
+    jne .drivebit_done
+    mov bl, 0x10
+.drivebit_done:
+    mov [ss:RAM_GEOM_DRIVEBIT], bl
+
     push ax                       ; сохраняем запрошенное число секторов (AL)
 
     ; --- вытаскиваем составляющие CHS в безопасные регистры ДО
@@ -1793,7 +1815,8 @@ int13h_read_sectors:
     mov dx, 0x1F6
     mov al, bh
     and al, 0x0F                                  ; биты 24-27 LBA
-    or al, 0xE0                                     ; master + LBA-режим
+    or al, 0xE0                                     ; зарезервированные биты + LBA-режим
+    or al, [ss:RAM_GEOM_DRIVEBIT]                    ; 0=master, 0x10=slave
     out dx, al
 
     mov dx, 0x1F2

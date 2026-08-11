@@ -352,6 +352,40 @@ doesn't, and the failure is specific to code that inspects the *raw*
 value not the ASCII" - check whether it's another `AH` vs `AL` /
 Set-1-vs-what-we-actually-decode mismatch before looking anywhere else.
 
+**One more gap found chasing the same GRUB session**: with Enter fixed,
+`ls` at the `grub>` prompt listed a *huge* number of drives (`hd4`
+through `hd14`+, plus `(cd)`) instead of the one or two actually
+attached. Cause: `int13h_read_sectors` always addressed the primary
+channel's *master* drive - `DL` was read for geometry (floppy vs HDD)
+but never used to select master vs slave in the drive/head register
+(port `0x1F6`). GRUB enumerates by probing many possible BIOS drive
+numbers; every probe landed on the same physical `-hda`, so it looked
+like a dozen identical disks, and a genuinely different attached disk
+(`-hdb`) was completely unreachable regardless of which `DL` addressed
+it. Fix: `RAM_GEOM_DRIVEBIT` (`0x0518`, same "transient scratch, not
+persistent state" pattern as `RAM_GEOM_SPT`/`_HPC` - computed once near
+the top of `int13h_read_sectors` while `DL` is still intact, since the
+LBA math's `mul` clobbers it later) holds `0x10` (slave) or `0`
+(master), OR'd into the `0x1F6` write in `.sector_loop`. Only `DL=0x81`
+(the primary channel's other drive, matching QEMU's `-hdb`) maps to
+slave; higher drive numbers would need a secondary ATA channel
+(`0x170`-`0x177`) this project doesn't implement, so they quietly fall
+back to master rather than erroring - same philosophy as everywhere else
+unsupported input is silently treated as "closest reasonable thing."
+
+**Caught its own bug while writing the fix, before it ever reached
+testing**: the first version computed the drivebit into `al` right
+before the existing `push ax` that preserves the caller's requested
+sector count (also in `al`) - clobbering the real input before it got
+saved, silently breaking every multi-sector read (`stage2.bin` stopped
+loading entirely - `boot.asm` hung at "loading stage 2" with zero further
+progress). Caught by running the existing regression test immediately
+after the change, per this project's own rule of testing every change,
+not just the new code path. Fixed by computing the drivebit into `bl`
+instead (`bx` is free at that point - its only job so far was `mov di,
+bx` to capture the destination buffer offset) so it never touches the
+register the very next instruction needs intact.
+
 The test disk (`boot.asm`+`stage2.asm`) is a real two-stage loader now,
 not one packed sector: stage 1 reads stage 2 via `int 13h` `AH=0x02` and
 jumps to it, which is both a demonstration of that call and the reason
