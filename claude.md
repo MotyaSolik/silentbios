@@ -174,8 +174,10 @@ Please keep doing that. Specifically:
 
 See `README.md` for the full list (COM1 serial, VGA text mode + font,
 POST diagnostics, Scan-Set-2 keyboard + setup menu, CMOS/NVRAM persistence,
-disk boot via raw ATA PIO, `int 10h` AH=0x0E/0x00/0x02/0x03/0x0F, `int 16h`
-AH=0x00/0x01, `int 13h` AH=0x00/0x02/0x08, `int 12h`, `int 15h` AH=0x88).
+disk boot via raw ATA PIO, `int 10h` AH=0x0E/0x00/0x02/0x03/0x0F/0x09,
+`int 16h` AH=0x00/0x01, `int 13h` AH=0x00/0x02/0x08, `int 12h`, `int 15h`
+AH=0x88 - the last three added specifically to get GRUB booting, see
+below).
 
 `int 10h` `AH=0x00` (set mode 3 only), `AH=0x02`/`0x03` (cursor, including
 the real hardware CRTC cursor via ports `0x3D4`/`0x3D5`), and `AH=0x0F`
@@ -252,7 +254,69 @@ but memory detection wasn't the blocker; whatever runs after that last
 disk read is FreeDOS's own logic, not a missing BIOS service, and
 diagnosing further would mean disassembling FreeDOS itself rather than
 extending this project - a genuinely different, bigger task, so this is
-where the experiment stopped (for now).
+where the FreeDOS experiment stopped (for now) - **but see the GRUB
+section right below, which succeeded** and turned out to be the more
+productive test case, precisely because it names its missing dependency
+instead of silently hanging.
+
+**GRUB boots to an interactive `grub rescue>` prompt on this BIOS.**
+Tried on a hunch that a portable, text-mode-first bootloader designed to
+run on decades of inconsistent real BIOSes would be a better test case
+than a full OS - it was. Unlike FreeDOS, GRUB *degrades gracefully* and
+*prints specific error messages* instead of hanging silently, which
+turned this from "guess and instrument our own ISR" into "read the
+error, fix the exact thing it names" three times in a row:
+
+1. Built a test image: `grub-mkrescue --output=grub_test.iso <dir with
+   boot/grub/grub.cfg>` (needs `xorriso`; the resulting ISO is isohybrid
+   - bootable via `-hda` directly, not just `-cdrom`). Verified it boots
+   under plain QEMU's own BIOS first (rules out a bad build). First try
+   under this project's `-bios`: printed `GRUB loading..` (proof its
+   boot.img actually ran our `int 10h`/`int 13h`) then went visually
+   quiet. `int13h_isr`/`int12h_isr`/`int15h_isr` all get a shared
+   temporary `dbg_tagX` logger (removed after, never committed) for this
+   kind of investigation - same trick as the FreeDOS one, generalized to
+   log any/all of the three at once with a one-letter tag per interrupt.
+2. The log showed GRUB probing `int13h AH=0x41` (check LBA extensions)
+   first - we don't support it, so it correctly got `CF=1` and GRUB fell
+   back to CHS (`AH=0x02`), exactly per spec, no fix needed there. Then
+   217,158 `int16h AH=0x01` polls and nothing else - not a hang, GRUB was
+   sitting at its menu/timeout loop the whole time, just not drawing
+   anything. Cross-referencing the `int10h` log: 137 calls to `AH=0x09`
+   (write char+attribute at cursor, no cursor move - used for colored
+   menu borders/boxes) that we silently no-op'd. Added
+   `int10h_write_char_attr` (`AH=0x09`) - straightforward, no flag
+   return needed, just writes `CX` copies of `AL`/`BL` starting at
+   `RAM_VGA_POS` without touching it.
+3. Next run got much further and printed an actual GRUB kernel error:
+   `kern/mm.c:grub_memalign:552: out of memory`. GRUB's heap allocator
+   sizes itself from `int15h AH=0x88` (extended memory) - which
+   previously returned an honest `0`, starving it. Rather than
+   implementing A20-gate + real probing above 1 MB, checked whether the
+   platform already exposes the answer: wrote a one-off test disk that
+   reads CMOS offsets `0x17`/`0x18`/`0x30`/`0x31`/`0x34`/`0x35` directly
+   and prints them. `0x34`/`0x35` (memory above 16 MB, in 64 KB units)
+   came back as exactly QEMU's default 128 MB RAM - confirming the
+   platform *does* populate the standard PC/AT CMOS memory-size fields,
+   the same way real firmware does, and a from-scratch BIOS can just
+   read them instead of probing. `int15h_ext_mem_kb` now reads CMOS
+   `0x17` (low byte) + `0x18` (high byte) directly via the existing
+   `cmos_read_byte` - the standard field for "KB above 1 MB", naturally
+   saturating at `0xFFFF` (~64 MB), which matches `AH=0x88`'s own
+   historical ceiling anyway.
+4. Next run: `error: kern/fs.c:grub_fs_probe:122: unknown filesystem`
+   (repeated per device probed), then `Entering rescue mode...` and a
+   live `grub rescue>` prompt - typed characters echo back in real time
+   via `sendkey`. The filesystem error is expected and unrelated to the
+   BIOS: the test image is an ISO9660 layout (built for El Torito CD
+   boot) being fed in as a raw `-hda` disk, so GRUB's own filesystem
+   drivers correctly don't recognize what's on it. The BIOS layer -
+   `int10h`/`int13h`/`int15h`/`int16h` all exercised together by real,
+   unmodified GRUB code - worked end to end.
+
+Each of the three fixes above was found by literally reading what GRUB
+printed, not by guessing - the same "don't assume, verify" discipline as
+the rest of this project, just pointed at someone else's code for once.
 
 The test disk (`boot.asm`+`stage2.asm`) is a real two-stage loader now,
 not one packed sector: stage 1 reads stage 2 via `int 13h` `AH=0x02` and

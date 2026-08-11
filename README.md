@@ -41,7 +41,10 @@ VGA screenshots along the way.
   poking video memory/ports directly. Supported functions: `AH=0x0E`
   (teletype output), `AH=0x00` (set video mode — mode `0x03` only),
   `AH=0x02`/`0x03` (set/get cursor position, including the real hardware
-  CRTC cursor via ports `0x3D4`/`0x3D5`), and `AH=0x0F` (get video mode).
+  CRTC cursor via ports `0x3D4`/`0x3D5`), `AH=0x0F` (get video mode), and
+  `AH=0x09` (write character+attribute without moving the cursor — added
+  because GRUB uses it to draw its menu's colored border; without it GRUB
+  ran fine but drew nothing).
 - **A real `int 16h` handler** (keyboard services), decoding the same raw
   Scan Set 2 polling used by the setup menu into ASCII, with Shift support.
   `AH=0x00` reads a character (blocking), `AH=0x01` checks for one without
@@ -61,11 +64,24 @@ VGA screenshots along the way.
   success, since for disk I/O that's more dangerous than for video/keyboard.
 - **`int 12h`** (conventional memory size) and **`int 15h` `AH=0x88`**
   (extended memory size). `int 12h` reports whatever `post_memory_test`
-  actually measured at POST (0–640 KB); `int 15h` `AH=0x88` honestly
-  reports `0` since extended memory (above 1 MB) isn't tested — making up
-  a number would be worse than admitting it's unverified. Other `int 15h`
-  functions return `CF=1`/`AH=0x86` ("unsupported function"), matching
-  real BIOS behavior for the same case.
+  actually measured at POST (0–640 KB). `int 15h` `AH=0x88` reads the
+  answer straight out of the standard PC/AT CMOS bytes `0x17`/`0x18`
+  (extended memory in KB), which the platform — real hardware or QEMU —
+  fills in itself; this project doesn't probe memory above 1 MB on its
+  own (no A20 gate/unreal-mode support). Other `int 15h` functions return
+  `CF=1`/`AH=0x86` ("unsupported function"), matching real BIOS behavior
+  for the same case.
+
+## It boots GRUB
+
+A real `grub-mkrescue`-built GRUB image reaches an interactive
+`grub rescue>` prompt on this BIOS — typed commands echo back, exactly
+like on real hardware. (The filesystem it's on shows as "unknown" in
+that prompt, because the test image is an ISO9660 CD layout being fed in
+as a raw disk — a test-image quirk, not a BIOS limitation.) Getting here
+took three fixes discovered by trying it and reading the exact failure:
+`int 13h`'s floppy/HDD geometry split, `int 10h AH=0x09` for GRUB's menu
+border, and real `int 15h AH=0x88` numbers instead of an honest zero.
 
 ## Layout
 
@@ -163,8 +179,12 @@ source:
 ## Known limitations
 
 - The `int 10h` handler supports `AH=0x0E`, `AH=0x00` (mode `0x03` only —
-  other mode numbers are silently ignored), `AH=0x02`/`0x03`, and `AH=0x0F`.
-  Other video functions are silently ignored.
+  other mode numbers are silently ignored), `AH=0x02`/`0x03`, `AH=0x0F`,
+  and `AH=0x09`. Other video functions — notably VESA/VBE (`AH=0x4F`,
+  needed for linear-framebuffer graphics modes) — are silently ignored,
+  which rules out any GUI-mode OS (tried KolibriOS reasoning through this
+  before even attempting it: it needs VBE for its framebuffer, a much
+  bigger gap than anything text-mode DOS/GRUB hit).
 - The `int 16h` handler only supports `AH=0x00`/`0x01`, and only produces
   ASCII for the main alphanumeric block (no numpad, function keys, or other
   non-ASCII keys). Extended (`E0`-prefixed) keys are skipped rather than
@@ -177,15 +197,15 @@ source:
   maximum-cylinder value regardless of the actual disk image size. Sectors
   are read one at a time (no true multi-sector burst transfer), which is
   simpler and more robust but slower.
-- A real FreeDOS floppy boots noticeably further with the fixes above
-  (its boot sector's own `int 13h` reads now land on the right sectors,
-  and `int 12h`/`int 15h AH=0x88` answer honestly) but still doesn't
-  reach a working prompt. It turns out `int 12h`/`int 15h` aren't even
-  the blocker — added and verified independently, then confirmed via a
-  temporary call-log that FreeDOS never calls either one; whatever it's
-  doing after its last `int 13h` read is its own internal logic, not a
-  missing BIOS service, and pinning that down would mean disassembling
-  FreeDOS itself rather than extending this project.
+- A real FreeDOS floppy boots noticeably further with the `int 13h`
+  geometry fix (its boot sector's own reads now land on the right
+  sectors) but still doesn't reach a working prompt — and, confirmed via
+  a temporary call-log, it's not because of `int 12h`/`int 15h` either:
+  FreeDOS never calls them at all. Whatever it does after its last
+  `int 13h` read is its own internal logic, not a missing BIOS service;
+  pinning that down would mean disassembling FreeDOS itself. GRUB (see
+  above) turned out to be the more useful test case — its error messages
+  named the exact missing piece each time, instead of a silent hang.
 - Disk boot (the BIOS's own MBR load) only reads LBA sector 0 — no
   partition table parsing.
 - The keyboard is read by polling, not IRQ/PIC-driven — fine for a setup
