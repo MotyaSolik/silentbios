@@ -196,14 +196,44 @@ multi-sector read across a sector boundary, and an induced "unsupported
 function" error) to catch a `patch_stack_cf` polarity bug *before* it
 could hide behind a plausible-looking screenshot (see the gotcha above) -
 none was found, everything was correct on the first pass this time. CHS→
-LBA uses a fixed, unqueried `SPT=63`/`HPC=16` geometry (`equ`s in
-`bios.asm`) since there's no `IDENTIFY DEVICE`; sectors are read one at a
-time, looping the same wait-BSY/wait-DRQ/transfer-256-words protocol as
+LBA uses an unqueried geometry picked by drive number (`int13h_read_
+sectors`/`int13h_get_params` both check `DL`) since there's no `IDENTIFY
+DEVICE`: `DL<0x80` → `SPT_FLOPPY=18`/`HPC_FLOPPY=2` (standard 1.44 MB),
+`DL>=0x80` → `SPT_HDD=63`/`HPC_HDD=16`. The values are stashed in RAM
+(`RAM_GEOM_SPT`/`RAM_GEOM_HPC`, `0x0514`/`0x0515` - transient scratch, not
+persistent state, just a workaround for running out of registers mid-
+calculation) rather than a register, since the LBA math already uses
+ax/bx/cx/dx/si/di/bp for other things. Sectors are read one at a time,
+looping the same wait-BSY/wait-DRQ/transfer-256-words protocol as
 `ata_read_mbr` rather than relying on the controller to deliver a
 multi-sector burst without re-checking DRQ. Unsupported functions
 explicitly set `CF=1`/`AH=1` (unlike `int10h`/`int16h`'s silent no-op) -
 for disk I/O, silently claiming success when nothing happened is worse
 than an honest error.
+
+**The floppy/HDD geometry split above was found empirically, not
+guessed**: downloaded a real FreeDOS 1.4 boot floppy image (confirmed
+valid by booting it under plain QEMU's own BIOS first, to rule out a bad
+download before blaming our code) and tried it under this project's
+`-bios`. It hung with a blank screen after the initial MBR jump - the
+usual "did it actually hang, or is it just not drawing anything"
+ambiguity from the `int16h` gotcha, so the fix was the same: add a
+temporary `dbg13_dump` call at the top of `int13h_isr` that serial-logs
+every `AH`/`AL`/`CH`/`CL`/`DH`/`DL` it receives (removed again after -
+this was diagnostic only, never committed). That showed FreeDOS's own
+boot sector calling `AH=0x02` with `DL=0x00` and CHS values implying an
+18-sectors/2-heads disk, while `int13h_read_sectors` was translating
+that CHS via the hard-disk `63/16` constants - reading real, valid,
+CF=0 data from the *wrong* LBA. After the DL-based fix, the same log
+showed it walking through far more of the disk (119 `int 13h` calls
+across multiple cylinders vs. ~22 before, looping) before going quiet -
+real progress, confirmed by a regression run against the existing HDD-
+geometry test disk to make sure `DL=0x80` behavior didn't change. It
+still doesn't reach a working `A:\>` prompt, though - something past the
+boot sector needs a BIOS service this project doesn't have (`int 15h`
+memory detection is the prime suspect, but wasn't confirmed - diagnosing
+further would mean instrumenting FreeDOS's own code, not just ours,
+which is a bigger undertaking than the DL-geometry fix was).
 
 The test disk (`boot.asm`+`stage2.asm`) is a real two-stage loader now,
 not one packed sector: stage 1 reads stage 2 via `int 13h` `AH=0x02` and

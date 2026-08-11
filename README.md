@@ -50,11 +50,15 @@ VGA screenshots along the way.
 - **A real `int 13h` handler** (disk services), so loaded bootloaders/OSes
   can read more than just the MBR without talking to the ATA controller
   themselves. `AH=0x00` (reset), `AH=0x02` (read sectors, CHS — translated
-  to LBA28 against an assumed `63 sectors/track, 16 heads` geometry, since
-  there's no `IDENTIFY DEVICE`), `AH=0x08` (get drive parameters). Reports
-  errors honestly: an unsupported function returns `CF=1`/`AH=1` rather than
-  silently claiming success, since for disk I/O that's more dangerous than
-  for video/keyboard.
+  to LBA28 against an assumed geometry, since there's no `IDENTIFY
+  DEVICE`), `AH=0x08` (get drive parameters). The assumed geometry depends
+  on the drive number: `DL<0x80` (floppy) gets `18 sectors/track, 2 heads`
+  (standard 1.44 MB), `DL>=0x80` (HDD) gets `63 sectors/track, 16 heads` —
+  found empirically by trying to boot a real FreeDOS floppy image and
+  watching, via a temporary serial log of every `int 13h` call, exactly
+  which CHS values its boot sector requested. Reports errors honestly: an
+  unsupported function returns `CF=1`/`AH=1` rather than silently claiming
+  success, since for disk I/O that's more dangerous than for video/keyboard.
 
 ## Layout
 
@@ -160,11 +164,16 @@ source:
   decoded, which means an extended key can alias a numpad key with the same
   trailing scan code — accepted as a simplification, not fixed.
 - The `int 13h` handler supports `AH=0x00`/`0x02`/`0x08` only, translates
-  CHS to LBA against an assumed (not queried) `63/16` sectors-per-track/
-  heads geometry, and doesn't implement `IDENTIFY DEVICE` — `AH=0x08`
-  always reports a generic maximum-cylinder value regardless of the actual
-  disk image size. Sectors are read one at a time (no true multi-sector
-  burst transfer), which is simpler and more robust but slower.
+  CHS to LBA against an assumed (not queried) geometry picked from the
+  drive number alone (`18/2` for `DL<0x80`, `63/16` for `DL>=0x80`), and
+  doesn't implement `IDENTIFY DEVICE` — `AH=0x08` always reports a generic
+  maximum-cylinder value regardless of the actual disk image size. A real
+  FreeDOS floppy boots further with this (its boot sector's own `int 13h`
+  reads now land on the right sectors) but still doesn't reach a working
+  prompt — something past the boot sector still needs a BIOS service this
+  project doesn't have yet (most likely `int 15h` memory detection).
+  Sectors are read one at a time (no true multi-sector burst transfer),
+  which is simpler and more robust but slower.
 - Disk boot (the BIOS's own MBR load) only reads LBA sector 0 — no
   partition table parsing.
 - The keyboard is read by polling, not IRQ/PIC-driven — fine for a setup

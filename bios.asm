@@ -27,6 +27,10 @@ RAM_KBD_SHIFT  equ 0x0510    ; byte: 1 = Shift (левый или правый) 
 RAM_KBD_PENDING equ 0x0511   ; byte: 1 = есть декодированная клавиша, ждущая выборки
 RAM_KBD_PENDING_CHAR equ 0x0512 ; byte: ASCII-код ожидающей клавиши
 RAM_KBD_PENDING_SCAN equ 0x0513 ; byte: сырой Scan Set 2 код ожидающей клавиши
+RAM_GEOM_SPT equ 0x0514      ; byte: секторов/дорожку для ТЕКУЩЕГО вызова
+                              ; int 13h AH=0x02/0x08 - не персистентно, просто
+                              ; рабочая область (в регистрах уже не хватает места)
+RAM_GEOM_HPC equ 0x0515      ; byte: головок для текущего вызова int 13h
 
 start:
     cli
@@ -1547,20 +1551,38 @@ int13h_reset:
     pop cx
     ret
 
-; int 13h AH=0x08 - параметры диска. Вход: DL=диск (игнорируем).
+; int 13h AH=0x08 - параметры диска. Вход: DL=диск - в отличие от
+; остальных функций, ЗДЕСЬ его не игнорируем: DL<0x80 (floppy) и
+; DL>=0x80 (HDD) получают разную геометрию (см. .floppy_params ниже
+; и комментарий у SPT_HDD/SPT_FLOPPY перед int13h_read_sectors - те
+; же константы, чтобы AH=0x08 и AH=0x02 не могли разъехаться).
 ; Выход: CH=младшие 8 бит макс.цилиндра, CL: биты0-5=SPT,
 ; биты6-7=старшие 2 бита макс.цилиндра; DH=макс.головка (HPC-1);
 ; DL=число дисков (1); AH=0. ES:DI (указатель на drive parameter
 ; table) не трогаем - большинство вызывающих читают геометрию через
 ; CH/CL/DH и не разыменовывают этот указатель.
-MAX_CYL equ 1023
+MAX_CYL_HDD    equ 1023   ; классический предел 10-битного поля
+MAX_CYL_FLOPPY equ 79      ; 80 дорожек (0-79) - стандарт для 1.44MB
 
 int13h_get_params:
-    mov ch, MAX_CYL & 0xFF
-    mov cl, (MAX_CYL >> 8) & 0x03
+    cmp dl, 0x80
+    jb .floppy_params
+
+    mov ch, MAX_CYL_HDD & 0xFF
+    mov cl, (MAX_CYL_HDD >> 8) & 0x03
     shl cl, 6
-    or cl, SPT
-    mov dh, HPC - 1
+    or cl, SPT_HDD
+    mov dh, HPC_HDD - 1
+    jmp .common
+
+.floppy_params:
+    mov ch, MAX_CYL_FLOPPY & 0xFF
+    mov cl, (MAX_CYL_FLOPPY >> 8) & 0x03
+    shl cl, 6
+    or cl, SPT_FLOPPY
+    mov dh, HPC_FLOPPY - 1
+
+.common:
     mov dl, 1
     xor ah, ah
     xor bl, bl
@@ -1569,13 +1591,22 @@ int13h_get_params:
 ; int 13h AH=0x02 - чтение секторов (CHS). Вход: AL=число секторов
 ; (0 трактуется как 1 - полный диапазон 256 нашим крошечным тестовым
 ; образам не нужен), CH=цилиндр(биты0-7), CL: биты0-5=сектор(1-63),
-; биты6-7=биты8-9 цилиндра, DH=головка, DL=диск (игнорируем),
-; ES:BX=буфер назначения. LBA считается 32-битно (dx:ax), но на
-; порты уходят только младшие 28 бит - тот же протокол, что и в
-; ata_read_mbr. Секторы читаются по одному (не пачкой) - проще и
-; надёжнее ждать DRQ перед каждым, чем полагаться на то, что
-; контроллер сам не потребует этого между секторами при multi-sector
-; READ.
+; биты6-7=биты8-9 цилиндра, DH=головка, DL=диск, ES:BX=буфер
+; назначения. LBA считается 32-битно (dx:ax), но на порты уходят
+; только младшие 28 бит - тот же протокол, что и в ata_read_mbr.
+; Секторы читаются по одному (не пачкой) - проще и надёжнее ждать
+; DRQ перед каждым, чем полагаться на то, что контроллер сам не
+; потребует этого между секторами при multi-sector READ.
+;
+; DL здесь НЕ игнорируется (в отличие от AH=0x00/0x08... то есть
+; кроме самого AH=0x08, который тоже теперь смотрит на DL - см. его
+; комментарий): DL<0x80 (floppy) транслирует CHS в LBA по геометрии
+; 18 секторов/дорожку, 2 головки (стандарт 1.44MB), DL>=0x80 (HDD) -
+; по 63/16. Раньше геометрия была одна жёстко зашитая (63/16) для
+; всех дисков - именно на этом споткнулась попытка загрузить с неё
+; настоящую дискету FreeDOS: её загрузчик читает по CHS из СВОЕЙ
+; (floppy) геометрии, мы транслировали по чужой (HDD) - в итоге
+; читали не те LBA, получали не те данные, без единой ошибки CF.
 ; Выход: AL=число реально прочитанных секторов, AH=код статуса,
 ; BL=0/1 для patch_stack_cf.
 ;
@@ -1585,8 +1616,10 @@ int13h_get_params:
 ; прочитанных секторов; bp - цилиндр, потом временный перенос при
 ; умножении, потом запрошенное число секторов; cx - LBA биты 0-15
 ; (cl/ch), bx - LBA биты 16-31 (bl/bh, реально нужны только 16-27).
-SPT equ 63
-HPC equ 16
+SPT_HDD    equ 63
+HPC_HDD    equ 16
+SPT_FLOPPY equ 18
+HPC_FLOPPY equ 2
 
 int13h_read_sectors:
     push si
@@ -1595,6 +1628,19 @@ int13h_read_sectors:
 
     mov di, bx                  ; di = буфер назначения (offset) - ES не
                                    ; трогаем, он уже = ES вызывающего кода
+
+    ; --- геометрия по DL - см. комментарий выше. Кладём в RAM
+    ; (RAM_GEOM_SPT/_HPC), а не в регистр: свободных регистров для
+    ; ещё одного значения, живущего через весь расчёт LBA, уже нет.
+    cmp dl, 0x80
+    jb .floppy_geom
+    mov byte [ss:RAM_GEOM_SPT], SPT_HDD
+    mov byte [ss:RAM_GEOM_HPC], HPC_HDD
+    jmp .geom_done
+.floppy_geom:
+    mov byte [ss:RAM_GEOM_SPT], SPT_FLOPPY
+    mov byte [ss:RAM_GEOM_HPC], HPC_FLOPPY
+.geom_done:
 
     push ax                       ; сохраняем запрошенное число секторов (AL)
 
@@ -1621,11 +1667,13 @@ int13h_read_sectors:
 
     ; --- LBA (32 бита, dx:ax) = (cylinder*HPC + head) * SPT + (sector-1) ---
     mov ax, bp
-    mov cx, HPC
+    xor ch, ch
+    mov cl, [ss:RAM_GEOM_HPC]
     mul cx                             ; dx:ax = cylinder*HPC
     add ax, bx                          ; + голова (пока ещё в bx)
     adc dx, 0
-    mov cx, SPT
+    xor ch, ch
+    mov cl, [ss:RAM_GEOM_SPT]
     push ax
     mov ax, dx
     mul cx
