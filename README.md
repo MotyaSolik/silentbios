@@ -49,7 +49,12 @@ VGA screenshots along the way.
   Scan Set 2 polling used by the setup menu into ASCII, with Shift support.
   `AH=0x00` reads a character (blocking), `AH=0x01` checks for one without
   consuming it (non-blocking, reports through `ZF`). Numpad, function keys,
-  and other non-ASCII keys are silently ignored.
+  and other non-ASCII keys are silently ignored. The scan code returned in
+  `AH` is translated to Scan Set 1 — the set `int 16h` is specified to
+  return regardless of what the controller actually speaks — found
+  necessary when GRUB, tested on real hardware by a user, typed letters
+  fine (it trusts `AL`) but Enter did nothing (it recognizes special keys
+  by `AH`, and got a raw Set 2 byte matching nothing in its Set 1 table).
 - **A real `int 13h` handler** (disk services), so loaded bootloaders/OSes
   can read more than just the MBR without talking to the ATA controller
   themselves. `AH=0x00` (reset), `AH=0x02` (read sectors, CHS — translated
@@ -74,14 +79,23 @@ VGA screenshots along the way.
 
 ## It boots GRUB
 
-A real `grub-mkrescue`-built GRUB image reaches an interactive
-`grub rescue>` prompt on this BIOS — typed commands echo back, exactly
-like on real hardware. (The filesystem it's on shows as "unknown" in
-that prompt, because the test image is an ISO9660 CD layout being fed in
-as a raw disk — a test-image quirk, not a BIOS limitation.) Getting here
-took three fixes discovered by trying it and reading the exact failure:
-`int 13h`'s floppy/HDD geometry split, `int 10h AH=0x09` for GRUB's menu
-border, and real `int 15h AH=0x88` numbers instead of an honest zero.
+A real GRUB install — proper MBR partition table, FAT32 partition,
+`grub-install --target=i386-pc` — boots to GRUB's actual colored menu on
+this BIOS, on real hardware, not just in QEMU. (An earlier attempt with a
+`grub-mkrescue` ISO9660 image only reached the `grub rescue>` fallback
+shell with an "unknown filesystem" error — a quirk of feeding a CD-layout
+image in as a raw disk, not a BIOS limitation; a properly-partitioned
+disk image doesn't hit it.)
+
+Four fixes got it here, every one found by trying it and reading the
+exact failure instead of guessing: `int 13h`'s floppy/HDD geometry
+split, `int 10h AH=0x09` for GRUB's menu border, real `int 15h AH=0x88`
+numbers instead of an honest zero, and — found only once a real user
+tried it on real hardware — translating the keyboard's Scan Set 2 codes
+to Scan Set 1 before returning them in `int 16h`'s `AH`. That last one
+mattered because GRUB trusts `AL` (ASCII) for regular typing but `AH`
+(scan code) to recognize special keys like Enter; letters worked long
+before Enter did.
 
 ## Layout
 

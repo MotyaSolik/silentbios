@@ -318,6 +318,40 @@ Each of the three fixes above was found by literally reading what GRUB
 printed, not by guessing - the same "don't assume, verify" discipline as
 the rest of this project, just pointed at someone else's code for once.
 
+**Fixed on the same GRUB test, but only surfaced once a real user tried
+it on real hardware**: with a properly `grub-install`'d disk (real MBR
+partition table + FAT32, built with actual root/loop-mount - this sandbox
+has no raw block device access, `cat /dev/sda3` is `Permission denied`
+here, so that build had to happen on the user's own machine), GRUB
+reached its real menu, confirming the ISO9660 `grub rescue>` case above
+really was just a test-image artifact. But then: typing letters at the
+`grub>` prompt worked, and **Enter did nothing** - reproducibly, with
+window focus confirmed. A dedicated test (below) proved `int16h` itself
+returns the right values (`AL=0x0D`/`AH=0x5A` for Enter, exactly
+correct), so the bug had to be in what GRUB does with a *correct*
+response. The answer: `int 16h` is specified to always return **Scan Set
+1** in `AH`, regardless of what the keyboard controller actually speaks -
+that's the whole point of the BIOS abstraction layer. This project's
+`kbd_service` decodes genuine Scan Set 2 (see the empirical-scan-code
+gotcha elsewhere in this file) but was passing that raw Set 2 byte
+straight through into `AH` instead of translating it. GRUB trusts `AL`
+(ASCII) for ordinary typing - which is why letters worked - but
+recognizes special keys like Enter by matching `AH` against its own Set
+1 table; a raw Set 2 `0x5A` matches nothing there, so Enter silently did
+nothing while every other key looked fine. Fix: `kbd_scan2to1`, a table
+in the same `0x00`-`MAX_SCAN` index space as `kbd_ascii_lo`/`kbd_ascii_hi`
+(same file, right after them), applied in `kbd_service`'s `.have_char`
+right before storing `RAM_KBD_PENDING_SCAN` - `bx` is still the original
+Set 2 index at that point, so it's a direct second lookup, no rework of
+the decode logic itself. Verified with a tiny dedicated test disk
+(`dbgenter.asm`-style: read a key, print `AL`/`AH` in hex, loop) against
+several keys including Shift+letter (confirms shift changes `AL` only,
+never the scan code, matching real keyboards) before trusting the fix.
+If a future bug looks like "some keys work, an unrelated-seeming one
+doesn't, and the failure is specific to code that inspects the *raw*
+value not the ASCII" - check whether it's another `AH` vs `AL` /
+Set-1-vs-what-we-actually-decode mismatch before looking anywhere else.
+
 The test disk (`boot.asm`+`stage2.asm`) is a real two-stage loader now,
 not one packed sector: stage 1 reads stage 2 via `int 13h` `AH=0x02` and
 jumps to it, which is both a demonstration of that call and the reason
