@@ -31,6 +31,8 @@ RAM_GEOM_SPT equ 0x0514      ; byte: секторов/дорожку для ТЕ
                               ; int 13h AH=0x02/0x08 - не персистентно, просто
                               ; рабочая область (в регистрах уже не хватает места)
 RAM_GEOM_HPC equ 0x0515      ; byte: головок для текущего вызова int 13h
+RAM_MEM_KB   equ 0x0516      ; word: объём conventional-памяти в KB, найденный
+                              ; post_memory_test (для int 12h)
 
 start:
     cli
@@ -69,6 +71,13 @@ start:
     ; (сама BIOS по-прежнему читает MBR напрямую через ata_read_mbr -
     ; у неё самой int 13h взять неоткуда).
     call install_int13h_vector
+
+    ; int 12h (объём conventional-памяти) и int 15h (AH=0x88 - объём
+    ; расширенной памяти) - см. их комментарии. RAM_MEM_KB, которую
+    ; читает int 12h, заполняет post_memory_test чуть ниже по коду
+    ; (ДО того, как загруженный код вообще сможет вызвать int 12h).
+    call install_int12h_vector
+    call install_int15h_vector
 
     call init_serial
 
@@ -1014,6 +1023,7 @@ post_memory_test:
     mov ax, cx
     mov dx, 64
     mul dx                 ; ax = cx * 64 = итог в KB
+    mov [ss:RAM_MEM_KB], ax  ; запоминаем для int 12h
     call print_dec_ax
 
     mov si, msg_kb
@@ -1433,6 +1443,7 @@ install_int13h_vector:
     pop ax
     ret
 
+
 int13h_isr:
     push si
     push di
@@ -1773,6 +1784,87 @@ int13h_read_sectors:
     pop di
     pop si
     ret
+
+; =========================================================
+; int 12h - объём conventional-памяти. В отличие от int 10h/13h/16h,
+; у настоящего int 12h никогда не было диспетчера по AH - это одна-
+; единственная функция. Выход: AX = KB памяти (0-640, кратно 64),
+; найденной post_memory_test при POST (см. RAM_MEM_KB). "Get"-функция,
+; поэтому AX не сохраняется - в нём и возвращается результат; больше
+; никакие регистры не трогаем, поэтому даже si/di/bp/ds/es сохранять
+; не нужно (не используются).
+; =========================================================
+install_int12h_vector:
+    push ax
+    push es
+
+    xor ax, ax
+    mov es, ax
+    mov word [es:0x12*4], int12h_isr
+    mov word [es:0x12*4+2], cs
+
+    pop es
+    pop ax
+    ret
+
+int12h_isr:
+    mov ax, [ss:RAM_MEM_KB]
+    iret
+
+; =========================================================
+; int 15h - системные сервисы. Поддерживается только AH=0x88 (объём
+; расширенной памяти сверх 1MB) - и то честно возвращает 0: мы её не
+; тестируем (post_memory_test проверяет только conventional-память,
+; 0-640KB), а выдумывать число опаснее, чем сказать "нет её". Прочие
+; функции явно сигнализируют "не поддерживается" (CF=1, AH=0x86 -
+; тот же код статуса, что использует для этого случая настоящий
+; BIOS), тем же приёмом (patch_stack_cf), что и int 13h - см. его
+; комментарий про регистровую конвенцию и про сам приём патча CF.
+; =========================================================
+install_int15h_vector:
+    push ax
+    push es
+
+    xor ax, ax
+    mov es, ax
+    mov word [es:0x15*4], int15h_isr
+    mov word [es:0x15*4+2], cs
+
+    pop es
+    pop ax
+    ret
+
+int15h_isr:
+    push si
+    push di
+    push bp
+    push ds
+    push es
+
+    cmp ah, 0x88
+    je .fn_88
+
+    pop es
+    pop ds
+    pop bp
+    pop di
+    pop si
+    mov ah, 0x86              ; "функция не поддерживается" - тот же
+                                ; код статуса, что и у настоящего BIOS
+    mov bl, 1
+    call patch_stack_cf
+    iret
+
+.fn_88:
+    pop es
+    pop ds
+    pop bp
+    pop di
+    pop si
+    xor ax, ax                  ; честно "0 KB" - расширенную память не тестировали
+    mov bl, 0
+    call patch_stack_cf
+    iret
 
 ; =========================================================
 ; Загрузка и запуск MBR с диска.

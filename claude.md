@@ -139,7 +139,12 @@ Please keep doing that. Specifically:
   return their result through those registers to the caller. If you add
   more functions, decide per-function whether it needs to preserve
   incoming ax/bx/cx/dx (a "set"-style call, push/pop them internally) or
-  return through them (a "get"-style call, leave them alone).
+  return through them (a "get"-style call, leave them alone). `int12h_isr`
+  takes this to its logical extreme: it's `mov ax,[ss:RAM_MEM_KB]` /
+  `iret` and nothing else, no register saves at all, since real `int 12h`
+  has no `AH` dispatch and no other registers to preserve. `int15h_isr`
+  follows the normal 3-ISR pattern despite only having one real function
+  (`AH=0x88`) plus a `patch_stack_cf`-based "unsupported" fallback.
 - **Returning a flag (not just registers) from a software interrupt**:
   `int 16h` `AH=0x01` and `int 13h` (`AH=0x00`/`0x02`/`0x08`) have to
   communicate their result through a flag (`ZF` / `CF`), but `iret`
@@ -170,7 +175,7 @@ Please keep doing that. Specifically:
 See `README.md` for the full list (COM1 serial, VGA text mode + font,
 POST diagnostics, Scan-Set-2 keyboard + setup menu, CMOS/NVRAM persistence,
 disk boot via raw ATA PIO, `int 10h` AH=0x0E/0x00/0x02/0x03/0x0F, `int 16h`
-AH=0x00/0x01, `int 13h` AH=0x00/0x02/0x08).
+AH=0x00/0x01, `int 13h` AH=0x00/0x02/0x08, `int 12h`, `int 15h` AH=0x88).
 
 `int 10h` `AH=0x00` (set mode 3 only), `AH=0x02`/`0x03` (cursor, including
 the real hardware CRTC cursor via ports `0x3D4`/`0x3D5`), and `AH=0x0F`
@@ -230,10 +235,24 @@ across multiple cylinders vs. ~22 before, looping) before going quiet -
 real progress, confirmed by a regression run against the existing HDD-
 geometry test disk to make sure `DL=0x80` behavior didn't change. It
 still doesn't reach a working `A:\>` prompt, though - something past the
-boot sector needs a BIOS service this project doesn't have (`int 15h`
-memory detection is the prime suspect, but wasn't confirmed - diagnosing
-further would mean instrumenting FreeDOS's own code, not just ours,
-which is a bigger undertaking than the DL-geometry fix was).
+boot sector needs *something*. `int 15h` memory detection was the prime
+suspect, so it got implemented next: `int 12h` (returns `RAM_MEM_KB`,
+now populated by `post_memory_test`) and `int 15h` `AH=0x88` (honestly
+returns `AX=0` - extended memory above 1 MB was never tested, so
+claiming a number would be worse than admitting it's unverified; other
+`int 15h` functions return `CF=1`/`AH=0x86`, matching real BIOS
+behavior for "unsupported"). Both were verified independently first
+(a small dedicated test disk checking `int12h`'s AX and `int15h`
+`AH=0x88`/`AH=0x00`'s CF+AX+AH - correct on the first pass) before even
+touching FreeDOS again. Then, re-running FreeDOS with a call-logger on
+all three interrupts (`int12h`/`int13h`/`int15h`) showed it **never
+calls `int 12h` or `int 15h` at all** - it makes the same ~119 `int 13h`
+calls as before and goes quiet. So the geometry fix was real progress,
+but memory detection wasn't the blocker; whatever runs after that last
+disk read is FreeDOS's own logic, not a missing BIOS service, and
+diagnosing further would mean disassembling FreeDOS itself rather than
+extending this project - a genuinely different, bigger task, so this is
+where the experiment stopped (for now).
 
 The test disk (`boot.asm`+`stage2.asm`) is a real two-stage loader now,
 not one packed sector: stage 1 reads stage 2 via `int 13h` `AH=0x02` and

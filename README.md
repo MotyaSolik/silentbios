@@ -59,6 +59,13 @@ VGA screenshots along the way.
   which CHS values its boot sector requested. Reports errors honestly: an
   unsupported function returns `CF=1`/`AH=1` rather than silently claiming
   success, since for disk I/O that's more dangerous than for video/keyboard.
+- **`int 12h`** (conventional memory size) and **`int 15h` `AH=0x88`**
+  (extended memory size). `int 12h` reports whatever `post_memory_test`
+  actually measured at POST (0–640 KB); `int 15h` `AH=0x88` honestly
+  reports `0` since extended memory (above 1 MB) isn't tested — making up
+  a number would be worse than admitting it's unverified. Other `int 15h`
+  functions return `CF=1`/`AH=0x86` ("unsupported function"), matching
+  real BIOS behavior for the same case.
 
 ## Layout
 
@@ -167,13 +174,18 @@ source:
   CHS to LBA against an assumed (not queried) geometry picked from the
   drive number alone (`18/2` for `DL<0x80`, `63/16` for `DL>=0x80`), and
   doesn't implement `IDENTIFY DEVICE` — `AH=0x08` always reports a generic
-  maximum-cylinder value regardless of the actual disk image size. A real
-  FreeDOS floppy boots further with this (its boot sector's own `int 13h`
-  reads now land on the right sectors) but still doesn't reach a working
-  prompt — something past the boot sector still needs a BIOS service this
-  project doesn't have yet (most likely `int 15h` memory detection).
-  Sectors are read one at a time (no true multi-sector burst transfer),
-  which is simpler and more robust but slower.
+  maximum-cylinder value regardless of the actual disk image size. Sectors
+  are read one at a time (no true multi-sector burst transfer), which is
+  simpler and more robust but slower.
+- A real FreeDOS floppy boots noticeably further with the fixes above
+  (its boot sector's own `int 13h` reads now land on the right sectors,
+  and `int 12h`/`int 15h AH=0x88` answer honestly) but still doesn't
+  reach a working prompt. It turns out `int 12h`/`int 15h` aren't even
+  the blocker — added and verified independently, then confirmed via a
+  temporary call-log that FreeDOS never calls either one; whatever it's
+  doing after its last `int 13h` read is its own internal logic, not a
+  missing BIOS service, and pinning that down would mean disassembling
+  FreeDOS itself rather than extending this project.
 - Disk boot (the BIOS's own MBR load) only reads LBA sector 0 — no
   partition table parsing.
 - The keyboard is read by polling, not IRQ/PIC-driven — fine for a setup
