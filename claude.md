@@ -402,6 +402,410 @@ single ATA channel can actually reach) gets a real answer. Verified with
 a small test disk calling `AH=0x08` for `DL=0x80/0x81/0x82/0xFF` and
 checking `CF`: first two succeed, last two correctly fail.
 
+**That `DL` rejection then immediately broke real GRUB booting entirely**
+- a properly `grub-install`'d disk, freshly rebuilt with no install
+errors, started printing `GRUB loadingRead Error` on *this project's*
+BIOS even with a single disk attached (`DL=0x80` only, no `-hdb`,
+no phantom-drive complexity involved at all). Reproduced first in this
+sandbox against the known-good `grub_test.iso` (confirmed working at the
+previous commit, broken at this one) before touching any code - bisecting
+commit by commit isolated it to exactly the `DL` rejection commit, which
+was suspicious on its own since that check only rejects `DL>=0x82` and a
+single-disk boot never uses those values. Root cause turned out to be one
+commit further back, just newly *exposed*: `int13h_read_sectors` reuses
+`DX` as a plain scratch register for ATA port addresses (`mov dx, 0x1F6`,
+`mov dx, 0x1F0`, etc.) throughout the sector loop and never restored it
+before returning, so the caller got back whatever port address was last
+loaded into `DX` (`0x1F0`) instead of its own `DL` (drive number) - a
+real BIOS's `AH=0x02` never touches `DL`/`DH` on output, only `AH`/`CF`.
+Confirmed with a temporary serial dump logging every `int13h` call's
+`AH`/`DL`/`AL`/`CH`/`CL`/`DH` (removed after, never committed): GRUB's
+`boot.img` reads `diskboot.img` (1 sector, `DL=0x80` - correct) and gets
+back a *technically successful* read, but the very next call - GRUB's
+own `diskboot.img` reading the rest of `core.img` - went out with
+`DL=0xF0`, the low byte of `0x1F0` left over in `DX` from the previous
+call's ATA transfer loop. Before the `DL` rejection commit, that garbage
+`DL` silently aliased back to master and (usually) still returned
+plausible-looking data, masking the bug; after it, the same garbage `DL`
+correctly got refused, turning a silent latent bug into a visible one.
+Fixed by giving `int13h_read_sectors` the same treatment `int13h_reset`
+already had (`push dx` at entry, `pop dx` right before `ret` in the
+shared `.exit:` path) so the caller's original `DL`/`DH` survive the
+function's internal port-address reuse of `DX`. Verified against the
+same `grub_test.iso` (now reaches the real GNU GRUB boot menu instead of
+`Read Error`) and the full existing regression disk (still clean) before
+calling it fixed. Lesson: a passing single-disk-shaped regression test
+doesn't rule out a bug that's been there all along and only *looked*
+harmless because nothing was checking its output strictly enough yet -
+tightening one check can unmask an older, unrelated one.
+
+**Another real-hardware-only gap, found via GRUB's `multiboot` command
+booting a user's own hobby OS kernel**: the kernel has its own PS/2
+keyboard driver (not going through `int 16h` at all - `multiboot` hands
+control to a 32-bit protected-mode kernel directly, so BIOS real-mode
+services are out of the picture from that point on) that stopped
+receiving any input under this BIOS, while working fine chainloaded from
+a real one. First guess, before seeing any of the kernel's actual source:
+the driver probably hooks the *default* IRQ1 vector without doing its own
+8259 PIC remap, relying on the BIOS having already done it - a common
+simplification in early-stage hobby OSes. This project never had any PIC
+remap at all (no code anywhere touched ports `0x20`/`0x21`/`0xA0`/`0xA1`),
+so that looked like a solid lead, and it's true that a real PC/AT BIOS
+always reprograms the PIC during POST (`ICW1`-`ICW4`, master IRQ0-7 ->
+`INT 0x08`-`0x0F`, slave IRQ8-15 -> `INT 0x70`-`0x77`). Added `pic_init`
+(called early in `start:`) doing that standard sequence, mask left as
+IRQ0/1/2 unmasked - verified the existing test disk and GRUB's own menu
+still passed, but **the user's kernel still got no input**. Turned out the
+guess was only half right: once the user shared the actual source
+(`idt.c`), it showed the kernel does its own complete PIC remap
+(`pic_remap()`, master offset `0x20` - so IRQ1 lands on vector 33, exactly
+matching its own `idt_set_gate(33, keyboard_handler_asm, ...)`), making
+this project's PIC state irrelevant either way. Real bug, found by reading
+the kernel's actual `keyboard.c`: it drives the keyboard entirely by
+IRQ (`inb(0x60)` inside the handler, `outb(0x20, 0x20)` EOI at the end -
+no polling fallback anywhere), which only ever fires if the keyboard
+*controller itself* is told to raise IRQ1 on data-ready - a separate
+concern from the PIC being able to relay it. That's bit 0 of the 8042
+Controller Configuration Byte (read via command `0x20`, written via
+command `0x60` on port `0x64`), and this project's own keyboard access
+is 100% polling (`kbd_service` and the POST self-test both just check
+status port bit 0 / bit 1 directly), so nothing here had ever needed that
+bit set - `post_keyboard_test` sent the `0xAA` self-test command and
+stopped there. Fixed by reading the Configuration Byte right after a
+successful self-test, setting bit 0 (IRQ1 enable) and explicitly clearing
+bit 6 (Set 2 -> Set 1 hardware translation - must stay off, this project's
+whole keyboard stack depends on receiving raw Set 2, see the gotcha
+elsewhere in this file) before writing it back - a read-modify-write
+rather than a hardcoded byte, so whatever the platform's other bits
+(mouse clock, system flag) already were is preserved. Every wait loop in
+that sequence times out and gives up silently rather than reporting
+failure - the self-test already proved the controller works, so a stuck
+Configuration Byte handshake isn't worth downgrading `Keyboard controller
+self-test: OK` over. Verified the existing test disk and GRUB's menu both
+still pass. Lesson twofold: don't stop at the first "this looks like a
+real BIOS gap" explanation just because it's plausible and fixes nothing
+that was already passing - read the other side's actual source once it's
+available, since a working PIC remap can fully mask a completely
+different missing piece one layer down; and a driver written
+polling-only can go a long time without anyone noticing it never
+enabled the one bit that only matters for IRQ-driven access.
+
+**Still not the whole story - user's kernel got closer but still no
+input after the 8042 fix, sending straight back to instrumented testing
+rather than guessing again.** Built a standalone multiboot ELF test
+kernel (32-bit, own tiny IDT, own `pic_remap`-style ICW sequence
+matching the user's `idt.c` exactly, an IRQ1 handler that increments a
+counter drawn to the screen) to check, from outside this project's own
+code entirely, whether a hardware IRQ1 ever reaches a CPU booted under
+this BIOS at all. It didn't - counter stayed at zero through repeated
+keypresses, with the PIC and 8042 both provably correctly configured by
+that point. Root cause: on any CPU with a Local APIC (which is
+effectively every CPU this BIOS will ever run on, including QEMU's),
+legacy PIC interrupts don't go to the CPU core directly - they're routed
+through the Local APIC's LINT0 pin, and per the Intel SDM that pin's LVT
+entry resets to *masked*. A real BIOS always programs it (delivery
+mode=ExtINT, unmasked) during POST; this project never had. Confirmed by
+adding exactly that one register write (`0xFEE00350 <- 0x700`) to the
+standalone test kernel - interrupts started arriving immediately, no
+other change. That register isn't reachable from 16-bit real mode
+(beyond conventional addressing), so fixing it in this project means a
+real->protected->real mode round-trip during POST, done carefully and
+reverted immediately after the one write.
+
+**That round-trip is where this stalled, and stayed stalled.** Every
+variant tried - a plain far `jmp` immediately after clearing `CR0.PE`
+(the textbook-correct, SDM-documented pattern), the same with an
+explicit `dword`/`word` operand-size override, a `retf`-based return
+with the target pushed manually, global instead of local labels for the
+jump targets (in case of some NASM local-label/bits-directive
+interaction), reloading `SS` before the transition (in case of a null
+selector during a fault), and - to rule out a silently swallowed
+exception entirely - a full 256-entry IDT built at runtime *in RAM*
+(0x1000, not ROM - writing new gate values into ROM at runtime silently
+no-ops, same "ROM is not RAM" gotcha as everywhere else in this project,
+and the first version of this diagnostic fell into exactly that trap)
+with every vector pointing at a handler that prints and hangs, so any
+fault at all would be visible - none of it reached the checkpoint placed
+immediately after the return jump. No exception fires (the all-vectors
+IDT never caught anything), no reset happens (`-no-reboot` plus
+`-d guest_errors` logged nothing, and a 10-second serial capture never
+repeated the POST banner the way earlier, unrelated bugs did when they
+actually triple-faulted), and the raw bytes at the jump target were
+independently verified correct via a hex dump of the assembled ROM. A
+GDB-remote session against QEMU's `-gdb` stub was the last thing tried
+and didn't produce a clean answer in the time spent on it. Given all of
+that - the entry into protected mode demonstrably works (later
+checkpoints inside the 32-bit block all fire, including the LAPIC write
+itself), and it's specifically the return leg that never completes for
+a reason none of the standard failure modes (wrong operand size, stale
+segment cache, swallowed fault, bad label math) explain - reverted the
+whole attempt rather than ship a mode switch this early in POST that
+isn't fully understood. A bug there risks the entire boot sequence for
+every user of this BIOS, not just IRQ-driven input for one kernel; that
+trade isn't worth it without a clean root cause. `pic_init` and the
+8042 IRQ1-enable fix both stayed (they're correct, real BIOS behavior,
+and harmless even though insufficient on their own).
+
+**Picked back up in a later session, asked explicitly to try again "a
+different way" rather than debug the same round-trip further** - and a
+different way turned out to exist: "unreal mode". The broken attempt's
+whole problem was the return leg of a `CS`-changing far `jmp`/`retf`
+back to real mode; unreal mode sidesteps that by never changing `CS` in
+the first place. Enter protected mode, load *only* `ES` with a flat
+(`0`-`4GB`) descriptor from a 2-entry GDT (null + one data descriptor -
+no code descriptor needed at all, since nothing ever jumps through it),
+drop `CR0.PE` back to 0, `jmp $+2` (a near jump - flushes the prefetch
+queue same as the SDM-mandated far jump would, but never touches `CS`,
+so there's no descriptor to reload and nothing to get wrong). `CS` keeps
+its original real-mode cache the entire time, untouched and never
+invalidated, so there's no return leg to fail. Wrote the LVT LINT0
+value through `ES` with an explicit `a32` address-size override (needed
+to encode a 32-bit displacement while still assembling as 16-bit code).
+Rebuilt, booted standalone under `-bios` with no test disk attached at
+all: POST completed and printed its normal banner - the mode switch
+itself no longer hangs. Verified the actual write landed by reading
+`0xFEE00350` back with the same technique from a small boot-sector
+diagnostic chainloaded after POST: `0x00000700`, exactly the intended
+value.
+
+**Reading it back correct didn't mean it worked yet** - a dedicated
+real-mode IRQ1 counter test (hook `IVT[0x09]`, `sti`, count on every
+scancode byte) still read zero after keypresses. Root-caused by checking
+the Local APIC's other half: the Spurious Interrupt Vector Register
+(`0xFEE000F0`) has its own separate "software enable" bit (bit 8) that
+gates the *entire* APIC, independent of any individual LVT entry's own
+mask bit - LVT LINT0 can be perfectly unmasked and still deliver nothing
+if this one is off, which it is by default (confirmed by reading it back
+first: `0x000000FF`, enable bit clear). Added a second `a32` write next
+to the LVT one (`0xFEE000F0 <- 0x1FF` - enable bit set, spurious vector
+`0xFF`) using the exact same unreal-mode excursion. First combined test
+of both writes together, run standalone as an isolated boot sector
+(not yet wired into the BIOS's own POST), completed cleanly. Wired into
+`lapic_unmask_lint0` and re-tested against the real-mode IRQ1 counter:
+it hung again - but this time *inside the test disk*, right after
+installing its `IVT[0x09]` handler and calling `sti`, never printing a
+single line. Not a regression in the fix itself: IRQ0 (the PIT timer)
+now genuinely fires on its own, continuously, needing no keypress at
+all, and that test disk had only ever installed a handler for `IVT[0x09]`
+- the very first automatic timer tick jumped into an untouched,
+garbage `IVT[0x08]` slot and took the whole test down. Added a second,
+trivial `IVT[0x08]` handler (read `AL`, `out 0x20,0x20`, `iret`) to the
+test disk and re-ran: the counter finally moved, and kept moving,
+correctly counting both the press and release event for every key.
+
+That same "nothing ever handled the timer because it never fired before"
+gap applies identically to any *loaded* real-mode code, including this
+project's own `boot.asm`, which does a plain `sti` as completely
+standard boot-sector practice - real BIOS is expected to have already
+installed minimal `INT 0x08`/`INT 0x09` handlers by the time a boot
+sector runs, and until this session, this one never had, because it
+never needed to (nothing was arriving to handle). Fixed properly instead
+of just in the throwaway test disk: `install_int08_vector` /
+`install_int09_vector`, called right after `lapic_unmask_lint0` in
+`start:`. `int08_isr` does what a real BIOS's timer tick handler
+minimally does - increments the BDA tick counter at `0x0040:0x006C` -
+then `EOI`s and returns; deliberately skips the midnight/day-rollover
+flag real BIOS also tracks, since nothing in this project reads it back
+(no `int 1ah` yet) and it would be complexity with no observable effect
+today. `int09_isr` doesn't reimplement scan-code decoding at all - it
+just calls the existing `kbd_service` (the same routine `int 16h`
+already polls) directly, then `EOI`s. That works precisely because by
+the time the ISR runs, a byte is already guaranteed to be waiting at
+port `0x60` (that's *why* IRQ1 fired), so `kbd_service`'s own internal
+"is there data yet" poll trivially succeeds on the first check - one
+decode path now transparently serves both polling (`int 16h`) and
+interrupt-driven callers, no duplicated logic. Re-ran the existing
+regression disk and GRUB's own menu (both went through the codepath
+that had just hung moments earlier, with real `sti` now genuinely live)
+- both clean.
+
+**Last mile: proving actual delivery into a protected-mode multiboot
+kernel, the user's original scenario** - rebuilt the same kind of
+32-bit multiboot test ELF used to originally diagnose the LVT0 gap (own
+tiny IDT, own PIC remap matching the user's `idt.c`, an IRQ1 counter
+drawn to the screen), booted it through GRUB under the now-fixed BIOS,
+and it reset the whole machine the instant the menu entry was selected -
+looked at first like the fix itself was unsafe under a real multiboot
+handoff, not just this project's own boot sector. Bisected with the same
+serial-checkpoint technique used throughout this whole investigation,
+letter by letter through the kernel's own setup: PIC remap done, IDT
+built, `lidt` done, `sti` done, all fine - the reset happened only once
+the first interrupt actually tried to fire, never reaching a checkpoint
+placed as the very first instruction inside the handler itself. Printed
+the live `CS`/`SS`/`ESP` values right before enabling interrupts to stop
+guessing: `CS=0x10`, not the `0x08` this quick test kernel's IDT-building
+code had hardcoded for every gate's selector field. GRUB's multiboot GDT
+layout simply isn't `0x08` for code in this GRUB version/build - the
+kernel's exception/IRQ gates were pointing interrupt delivery at a
+selector that didn't describe the running code segment at all, so the
+CPU faulted trying to use it the moment any interrupt needed to enter
+through the IDT. Fixed the *test kernel* (`mov word [gate+2], cs` instead
+of a hardcoded `0x08`) - not this BIOS, which had no part in that bug -
+and re-ran: no reset, and the on-screen counter read `0x0F` after five
+keypresses, both press and release counted, confirmed via serial log
+showing no repeated POST banner this time either. Lesson: a crash
+immediately downstream of a change is not proof the change caused it -
+the multiboot GDT-layout assumption this test kernel hardcoded had
+simply never been exercised before, for the exact same reason the whole
+LAPIC gap existed in the first place: no interrupt had ever survived
+long enough to reach it.
+
+The LAPIC LVT0 gap is fixed, verified at three levels now: real-mode
+IRQ1 (dedicated counter test), this project's own regression disk and
+GRUB's menu with real `sti` genuinely live, and a protected-mode
+multiboot kernel receiving real IRQ1 events end to end.
+
+**One more bug, found the moment real IRQ delivery started working and
+the user tried their actual OS again**: input arrived, but every key
+decoded to something else, consistently and specifically - `h` typed
+`,`, `e` typed `j` - and every keystroke was duplicated. Not random
+corruption: `,` and `j` are exactly what a *Scan Set 1* lookup table
+produces when fed the *Scan Set 2* codes for `h` (`0x33`) and `e`
+(`0x24`) - `kbd_us_set1[0x33]` is `,`, `kbd_us_set1[0x24]` is `j`,
+confirmed by hand against the kernel's own `keyboard.c` before touching
+any code. This project's 8042 fix (the IRQ1-enable one, earlier in this
+file) had deliberately left hardware Set 2->Set 1 translation *off*
+(Configuration Byte bit 6 cleared) specifically because this project's
+own `kbd_service` decodes raw Set 2 itself and only translates to Set 1
+in software, just for `int 16h`'s `AH` output - a deliberate, working
+design choice right up until something started reading port `0x60`
+directly instead of going through `int 16h`. The duplication had the
+same root cause, once traced through: Set 2's release code is a
+two-byte sequence (`0xF0` then the make code again), and the kernel's
+`scode2char` was written for Set 1's convention (release = make code
+with bit 7 set, one byte) - it silently ate the `0xF0` byte as an
+unrecognized "release" of nothing in particular, then treated the
+*next* byte (the repeated make code) as a brand new keypress, printing
+the same (wrong) character a second time.
+
+Real BIOS never has this problem because it always turns hardware
+translation *on* and writes its own keyboard code against Set 1 from
+the start - this project had instead chosen to decode Set 2 in software
+and translate only at the `int 16h` boundary, which is internally
+consistent but means anything bypassing `int 16h` (any real IRQ1
+consumer, which - until this session - had never once actually
+existed, for the same underlying reason IRQ1 itself never fired) sees
+raw Set 2 and misreads it as Set 1. Fixed by switching this project
+over to the same convention real BIOS uses instead of patching around
+it: Configuration Byte bit 6 now gets *set* (hardware translation on),
+and `kbd_service` was rewritten to consume Set 1 directly. This
+actually simplified the decoder - Set 1's release code is a single byte
+(make code | `0x80`), so the two-state F0-prefix state machine
+(`RAM_BREAK_FLAG`) went away entirely, along with the `kbd_scan2to1`
+software-translation table (no longer needed - the byte off the wire
+*is* already Set 1, `AH` just gets it directly). `kbd_ascii_lo`/`_hi`
+got rebuilt indexed by Set 1 codes instead of Set 2 (mechanically
+derived from the old Set2->Set1 table, cross-checked against the
+standard XT scancode layout). `setup_menu`'s own raw port-polling
+(`KEY_UP`/`KEY_DOWN`/`KEY_ENTER`/`KEY_ESC`) got the same treatment -
+Set 1 constants (`0x48`/`0x50`/`0x1C`/`0x01`), single-byte break
+detection, `RAM_BREAK_FLAG` references dropped. Verified three ways:
+an `int 16h`-driven typing test (`helloWorld123`, including a
+shifted letter, came back character-for-character correct with no
+duplicates), the setup menu's own arrow/Enter navigation, and - closest
+to the original bug report - a multiboot test kernel dumping raw
+scancode bytes to the screen for real keypresses, which read back
+`23 A3 12 92 26 A6 26 A6 18 98` for `h-e-l-l-o`: exactly the Set 1
+make/break pairs for each letter, byte for byte.
+
+**Setup menu grew up, once the keyboard was trustworthy enough to build
+more on top of it.** Asked for two things together: don't open setup on
+every boot (real BIOS convention - press a hotkey during a short window,
+Del by preference here, otherwise boot proceeds untouched), and add a
+few more settings. `prompt_setup_key` does the hotkey wait: same
+"E0 is just skipped, next byte processed normally" simplification this
+project uses everywhere for extended keys applies here too, since Del's
+dedicated key is `E0 53` in Set 1 and numpad Del (NumLock off) is bare
+`0x53` - one check catches both without decoding the E0 sequence
+specially. The wait itself is the same instruction-count busy-wait style
+as every other timeout in this project (no real-time clock involved,
+`IF` is still 0 this early), calibrated empirically rather than guessed:
+an outer/inner nested loop, timed via a Python harness watching the
+serial log's timestamps between "Press DEL" and "Booting" appearing -
+`dx=20` measured at a blink-and-you-miss-it ~0.05s (too short to
+actually react to), `dx=150` at 0.3s (still too short), `dx=1200` at a
+comfortable ~2.8s. Three new menu items followed: **Boot device**
+(Master/Slave, persisted in the same packed CMOS byte as Serial/VGA -
+bit2), **Quiet boot** (bit3 - suppresses the POST banner/memory-test/
+keyboard-test lines specifically on VGA via a new `print_vga_post`
+wrapper that checks the toggle before falling through to `print_vga`;
+serial is untouched, and failures are never suppressed, quiet or not),
+and **System Information** (a read-only view - conventional/extended
+memory, current boot drive, HDD/floppy CHS geometry - `int15h_ext_mem_kb`
+and the `SPT_HDD`/`HPC_HDD`/`SPT_FLOPPY`/`HPC_FLOPPY` constants reused
+directly rather than re-derived). Printing a *number* at an arbitrary
+screen position (needed for the memory figures) didn't exist yet -
+`print_dec_ax`'s digit-conversion loop got extracted into
+`num_to_dec_buf` so both it and the new `vga_print_dec_at` share the
+same division-by-10 logic instead of duplicating it.
+
+Testing "Quiet boot" surfaced one more small gap: toggling it on, then
+triggering a warm reset via the QEMU monitor's `system_reset` (chosen
+specifically because it preserves in-memory CMOS within the same QEMU
+process, unlike launching a fresh one - useful for testing persisted
+settings without relying on real NVRAM backing) left stale text from
+the *previous* boot's screen visible around the short "Press DEL..."
+prompt. Root cause: `system_reset` resets the CPU, not the VGA card - a
+real cold boot's video memory starts blank on its own, and the old,
+*non-quiet* boot sequence printed enough text to overwrite any leftover
+screen content by sheer volume, masking that nothing had ever explicitly
+cleared the screen at POST's start. Fixed with one `vga_clear_screen`
+call added right after the font loads, before the first thing POST ever
+prints - unconditional, not gated by Quiet boot, since a clean screen at
+boot is correct either way.
+
+**Real bug, not a test artifact, found immediately by building this**:
+`ata_read_mbr` had always addressed the ATA master unconditionally, no
+matter what `DL` `boot_try_disk` was about to hand the loaded code right
+after. Totally invisible before now, because the drive number was
+hardcoded in both places and they could only ever agree. The moment
+"Boot device" became a real setting, they could disagree: picking
+"Slave" would read the *master's* MBR into memory, then jump into it
+with `DL=0x81`, telling the loaded code it was booted from a drive it
+was never actually read from. Caught immediately by the most basic
+regression check (boot with "Slave" selected, only a master disk
+attached) - correctly reported "No bootable disk found" instead of
+silently booting the wrong physical disk under the wrong identity, which
+made the mismatch obvious rather than something that would have
+corrupted state quietly. Fixed by having `ata_read_mbr` read
+`RAM_BOOT_DRIVE` for its own master/slave bit on port `0x1F6`, same as
+`int13h_read_sectors` already does for loaded code's own disk reads.
+
+**System Information grew a CPU model line, on request.** `CPUID` works
+fine from 16-bit real mode - it's a plain instruction, not tied to
+protected mode, and by this point in the project's history there's
+already a working template for "briefly use 32-bit registers from real
+mode" (the unreal-mode LAPIC fix). Detection first: flip bit 21 (ID) of
+EFLAGS via `pushfd`/`popfd` and see if it actually toggles - the
+standard, decades-old way to check CPUID exists at all, since 386/486
+without it just won't let the bit change. Honest fallback chain, not a
+guess, matching this project's existing philosophy (`AH=0x88`'s real
+CMOS read, `AH=0x08`'s admittedly-fake geometry, both documented as such
+rather than papered over): CPUID present but no extended brand string
+(`EAX=0x80000000` returns less than `0x80000004`) falls back to the
+12-byte vendor ID string (`EAX=0`, universally available whenever CPUID
+exists at all); no CPUID at all prints "Unknown (no CPUID)" outright
+rather than inventing a value. The brand string itself is 3 leaves
+(`EAX=0x80000002/3/4`) of 16 bytes each, packed as `EAX:EBX:ECX:EDX` -
+comes back space-padded on real CPUs (Intel pads brand strings to a
+fixed width), so there's a trim pass shifting the string left to its
+first non-space character before display. One easy-to-miss bug caught
+before it ever got tested: initially wrote `mov si, RAM_CPU_BRAND` and
+called `vga_print_at` directly, exactly like every other label on that
+screen - except every *other* label lives in ROM (`CS`, which is also
+`DS` for basically this entire project), while `RAM_CPU_BRAND` is, as
+the name says, in RAM at segment `0`. `vga_print_at` reads through
+`DS:SI` with no override, so without explicitly swapping `DS` to `0`
+around that one call (`vga_print_dec_at` already had to solve the exact
+same problem for the memory-KB figures on the same screen), it would
+have silently printed 16 bytes of ROM starting at `0xF051C` instead of
+the CPU name - not a crash, just quietly wrong output, the kind of bug
+that's easy to ship if you don't specifically know to look for it after
+copy-pasting a working pattern into a spot with different addressing
+needs. Verified against actual QEMU output: `QEMU Virtual CPU version
+2.5+`, trimmed and positioned correctly on the System Information
+screen alongside everything else.
+
 The test disk (`boot.asm`+`stage2.asm`) is a real two-stage loader now,
 not one packed sector: stage 1 reads stage 2 via `int 13h` `AH=0x02` and
 jumps to it, which is both a demonstration of that call and the reason

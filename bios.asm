@@ -21,12 +21,14 @@ RAM_DEC_BUF  equ 0x0502      ; 8 байт: буфер для печати чис
 RAM_MENU_SEL equ 0x050A      ; word: индекс выбранного пункта меню
 RAM_SERIAL_ON equ 0x050C     ; byte: 1 = COM1-вывод включён
 RAM_VGA_ON    equ 0x050D     ; byte: 1 = VGA-вывод включён
-RAM_BREAK_FLAG equ 0x050E    ; byte: 1, если только что пришёл префикс F0 (break)
+                              ; 0x050E свободен - раньше RAM_BREAK_FLAG,
+                              ; больше не нужен с аппаратной трансляцией
+                              ; в Set 1 (отпускание - один байт, не F0+код)
 RAM_VIDEO_MODE equ 0x050F    ; byte: текущий видеорежим (для int 10h AH=0x0F)
 RAM_KBD_SHIFT  equ 0x0510    ; byte: 1 = Shift (левый или правый) сейчас зажат
 RAM_KBD_PENDING equ 0x0511   ; byte: 1 = есть декодированная клавиша, ждущая выборки
 RAM_KBD_PENDING_CHAR equ 0x0512 ; byte: ASCII-код ожидающей клавиши
-RAM_KBD_PENDING_SCAN equ 0x0513 ; byte: сырой Scan Set 2 код ожидающей клавиши
+RAM_KBD_PENDING_SCAN equ 0x0513 ; byte: Scan Set 1 код ожидающей клавиши
 RAM_GEOM_SPT equ 0x0514      ; byte: секторов/дорожку для ТЕКУЩЕГО вызова
                               ; int 13h AH=0x02/0x08 - не персистентно, просто
                               ; рабочая область (в регистрах уже не хватает места)
@@ -36,6 +38,17 @@ RAM_MEM_KB   equ 0x0516      ; word: объём conventional-памяти в KB,
 RAM_GEOM_DRIVEBIT equ 0x0518 ; byte: бит выбора master/slave (0x1F6, бит4)
                               ; для ТЕКУЩЕГО вызова int 13h AH=0x02 - как и
                               ; RAM_GEOM_SPT/_HPC, не персистентно
+RAM_ENTER_SETUP equ 0x0519   ; byte: 1 = во время prompt_setup_key нажат Del -
+                              ; не персистентно, живёт только до конца POST
+RAM_BOOT_DRIVE equ 0x051A    ; byte: DL диска для boot_try_disk (0x80=master,
+                              ; 0x81=slave) - персистентно, из setup-меню
+RAM_QUIET_BOOT equ 0x051B    ; byte: 1 = не печатать POST-диагностику на VGA
+                              ; (баннер/тест памяти/самотест клавиатуры) -
+                              ; персистентно, из setup-меню
+RAM_CPU_BRAND equ 0x051C     ; 49 байт: ASCIIZ строка модели CPU (CPUID) -
+                              ; не персистентно, как RAM_DEC_BUF - заново
+                              ; заполняется каждый раз при открытии System
+                              ; Information (см. cpu_get_brand)
 
 start:
     cli
@@ -82,8 +95,32 @@ start:
     call install_int12h_vector
     call install_int15h_vector
 
-    call init_serial
+    ; Настоящий BIOS всегда переинициализирует 8259 PIC во время POST
+    ; (IRQ0-7 -> INT 0x08-0x0F, IRQ8-15 -> INT 0x70-0x77) - иначе после
+    ; RESET контроллер прерываний не запрограммирован вообще. Мы сами
+    ; прерываниями не пользуемся (IF весь POST выключен - см. cli выше),
+    ; но загруженная ОС может на это полагаться неявно: если её
+    ; клавиатурный обработчик просто вешается на "стандартный" вектор
+    ; IRQ1, ожидая, что PIC уже приведён в это состояние настоящим BIOS
+    ; (частая практика в простых ОС, не делающих собственный remap),
+    ; без этого шага IRQ1 у неё либо не долетит до обработчика вообще,
+    ; либо попадёт на чужой вектор.
+    call pic_init
+    call lapic_unmask_lint0
 
+    ; Настоящий IRQ0 (таймер) и IRQ1 (клавиатура) теперь реально
+    ; доходят до CPU (см. lapic_unmask_lint0 выше) - а значит, любой
+    ; загруженный код, который просто честно делает "sti" (СТАНДАРТНАЯ
+    ; практика для boot-секторов, наш собственный boot.asm включая),
+    ; ожидает, что настоящий BIOS уже поставил обработчики на IVT[0x08]/
+    ; IVT[0x09] - без этого первый же таймерный тик прыгает в мусор
+    ; (что бы ни лежало в ещё не тронутой низкой памяти) и всё виснет.
+    ; Раньше это было незаметно ровно потому, что IRQ0/1 никогда не
+    ; доходили до CPU вообще - см. историю в claude.md.
+    call install_int08_vector
+    call install_int09_vector
+
+    call init_serial
     mov si, msg_banner
     call print_serial
 
@@ -99,9 +136,17 @@ start:
     ; закачать в Character Generator RAM (это "план 2" видеопамяти).
     call vga_load_font
 
+    ; Видеопамять не трогается процессорным reset (это отдельное от
+    ; CPU устройство) - на настоящей "холодной" загрузке она и так
+    ; чистая, но при Quiet boot (короткий вывод) вперемешку с warm
+    ; reset (например, Ctrl+Alt+Del) старый текст с предыдущей
+    ; загрузки иначе остаётся виден вокруг "Press DEL...". Раньше
+    ; это маскировалось длинным баннером/POST-выводом, перекрывавшим
+    ; экран целиком.
+    call vga_clear_screen
     mov word [ss:RAM_VGA_POS], 0
     mov si, msg_banner
-    call print_vga
+    call print_vga_post
 
     call post_memory_test
     call post_keyboard_test
@@ -109,18 +154,201 @@ start:
     mov si, msg_done
     call print_serial
     mov si, msg_done
-    call print_vga
+    call print_vga_post
 
+    ; Настоящий BIOS не открывает setup сам по себе каждую загрузку -
+    ; он коротко ждёт условленную клавишу (обычно Del) и, если её не
+    ; нажали, идёт сразу дальше. RAM_ENTER_SETUP выставляется внутри
+    ; prompt_setup_key, если Del успели нажать за отведённое время.
+    call prompt_setup_key
+    cmp byte [ss:RAM_ENTER_SETUP], 0
+    je .skip_setup
     call setup_menu
+.skip_setup:
 
-    ; Setup закрыт - продолжаем обычную последовательность загрузки:
-    ; пробуем найти и загрузить MBR с диска (как это делает
-    ; настоящий BIOS после POST/setup).
+    ; Setup закрыт (или не открывался) - продолжаем обычную
+    ; последовательность загрузки: пробуем найти и загрузить MBR с
+    ; диска (как это делает настоящий BIOS после POST/setup).
     call boot_try_disk
 
 halt_cpu:
     hlt
     jmp halt_cpu
+
+; =========================================================
+; Переинициализация (remap) 8259 PIC - master на порты 0x20/0x21,
+; slave на 0xA0/0xA1. Стандартная последовательность ICW1-ICW4,
+; та же, что делает любой настоящий PC/AT BIOS: master IRQ0-7 ->
+; INT 0x08-0x0F, slave IRQ8-15 -> INT 0x70-0x77 (без этого IRQ0-7
+; конфликтовали бы с векторами процессорных исключений 0x00-0x07 -
+; собственно, поэтому remap обязателен даже для тех, кто прерывания
+; не использует). Маски (OCW1) оставляем как у типичного BIOS:
+; открыты только IRQ0 (таймер), IRQ1 (клавиатура) и IRQ2 (каскад на
+; slave, без него ничего со slave вообще не дойдёт до CPU), slave
+; полностью замаскирован - каждая ОС/драйвер сама открывает то, что
+; ей реально нужно.
+; =========================================================
+pic_init:
+    push ax
+
+    mov al, 0x11          ; ICW1: edge-triggered, cascade, ICW4 будет
+    out 0x20, al
+    out 0xA0, al
+
+    mov al, 0x08           ; ICW2 (master): вектор смещения IRQ0 = 0x08
+    out 0x21, al
+    mov al, 0x70            ; ICW2 (slave): вектор смещения IRQ8 = 0x70
+    out 0xA1, al
+
+    mov al, 0x04              ; ICW3 (master): slave подключен на IRQ2
+    out 0x21, al
+    mov al, 0x02                ; ICW3 (slave): свой ID = 2
+    out 0xA1, al
+
+    mov al, 0x01                  ; ICW4: 8086/88 mode на обоих
+    out 0x21, al
+    out 0xA1, al
+
+    mov al, 0xF8                    ; OCW1 (master): открыты IRQ0/1/2
+    out 0x21, al
+    mov al, 0xFF                      ; OCW1 (slave): всё закрыто
+    out 0xA1, al
+
+    pop ax
+    ret
+
+; =========================================================
+; Разблокировка доставки аппаратных IRQ через 8259 PIC до самого
+; CPU - регистр LVT LINT0 у Local APIC (физический адрес
+; 0xFEE00350). По Intel SDM этот вход после RESET замаскирован по
+; умолчанию - без явного снятия маски НИ ОДНО аппаратное прерывание
+; не доходит до ядра, даже если PIC (см. pic_init выше) и
+; периферия настроены абсолютно правильно. Настоящий BIOS всегда
+; это делает; подробная история находки (включая первую, неудачную
+; попытку через полноценный real->protected->real переход с
+; far jmp) - в claude.md.
+;
+; Адрес 0xFEE00350 недостижим из чистой сегментной адресации
+; реального режима (максимум ~1 МБ+64K через A20). Первая попытка
+; решить это полным переключением в 32-битный protected mode (со
+; сменой CS через far jmp туда и обратно) стабильно проваливалась
+; на обратном прыжке по необъяснённой причине. Эта версия использует
+; "unreal mode" - CS вообще не трогается: PE=1 включается, ES
+; ненадолго получает плоский (0-4ГБ) дескриptor из GDT, PE=0
+; выключается обратно - и всё это время CS остаётся тем же самым
+; реальным сегментом с тем же самым кэшем, каким был всегда, поэтому
+; никакой валидации/перезагрузки CS не происходит и в ней нечему
+; сломаться. `jmp $+2` после возврата - обычный ближний переход
+; (не far, CS не трогает), нужен только чтобы сбросить очередь
+; предвыборки после смены CR0.PE - как и весь остальной POST, это
+; выполняется с IF=0 (см. cli в start:), так что делать это можно
+; спокойно.
+; =========================================================
+lapic_unmask_lint0:
+    pusha
+    push es
+
+    lgdt [gdt_descriptor]
+
+    mov eax, cr0
+    or eax, 1
+    mov cr0, eax
+
+    mov ax, 0x08
+    mov es, ax
+
+    mov eax, cr0
+    and eax, 0xFFFFFFFE
+    mov cr0, eax
+
+    jmp $+2
+
+    a32 mov dword [es:0xFEE000F0], 0x1FF   ; SVR: bit8=APIC software enable, spurious vector 0xFF
+    a32 mov dword [es:0xFEE00350], 0x700   ; LVT LINT0: delivery mode=ExtINT(0b111), unmasked
+
+    pop es
+    popa
+    ret
+
+gdt_start:
+    dq 0
+gdt_data:
+    dw 0xFFFF, 0x0000
+    db 0x00, 10010010b, 11001111b, 0x00
+gdt_end:
+
+gdt_descriptor:
+    dw gdt_end - gdt_start - 1
+    dd 0xF0000 + gdt_start
+
+; =========================================================
+; IRQ0 (таймер) и IRQ1 (клавиатура) - настоящие аппаратные
+; обработчики на IVT[0x08]/IVT[0x09], как у любого реального BIOS.
+; Отдельная пара от install_int10h_vector и т.п. выше: те ставят
+; вектора для СОФТВЕРНЫХ "int N" вызовов (сервисы, которые кто-то
+; сам вызывает), а эти два - для настоящих HARDWARE IRQ, которые
+; CPU получает сам, без чьего-либо "int" (нужны, только когда
+; interrupt flag реально включён где-то в загруженном коде).
+; =========================================================
+install_int08_vector:
+    push ax
+    push es
+
+    xor ax, ax
+    mov es, ax
+    mov word [es:0x08*4], int08_isr
+    mov word [es:0x08*4+2], cs
+
+    pop es
+    pop ax
+    ret
+
+install_int09_vector:
+    push ax
+    push es
+
+    xor ax, ax
+    mov es, ax
+    mov word [es:0x09*4], int09_isr
+    mov word [es:0x09*4+2], cs
+
+    pop es
+    pop ax
+    ret
+
+; IRQ0: считаем тики в BDA (0x0040:0x006C), как настоящий BIOS -
+; ничего, кроме этого счётчика, само по себе от таймера не зависит,
+; но не увеличивать его молча вместо честного счёта было бы хуже
+; (см. философию "явная нулевая честность лучше тихой лжи" у
+; int13h выше) - а рассинхронизация суток (полночный флаг) за
+; пределами того, что нужно этому проекту.
+int08_isr:
+    push ax
+    push es
+
+    mov ax, 0x0040
+    mov es, ax
+    inc dword [es:0x6C]
+
+    mov al, 0x20
+    out 0x20, al
+    pop es
+    pop ax
+    iret
+
+; IRQ1: просто переиспользуем kbd_service - к моменту вызова ISR
+; байт уже точно есть на порту 0x60 (иначе IRQ бы не случился), так
+; что её собственный поллинг-чек тривиально пройдёт с первого раза.
+; Один и тот же однослотовый буфер (RAM_KBD_PENDING/_CHAR/_SCAN)
+; работает одинаково что при IRQ-доставке, что при обычном поллинге
+; из int16h - ничего дублировать не пришлось.
+int09_isr:
+    push ax
+    call kbd_service
+    mov al, 0x20
+    out 0x20, al
+    pop ax
+    iret
 
 ; =========================================================
 ; COM1: инициализация 9600 8N1
@@ -465,8 +693,9 @@ int10h_write_char_attr:
 ;   AH=0x01 - неблокирующая проверка (ZF=1 если клавиш нет; иначе
 ;             ZF=0 и AL/AH заполнены, КАК И в AH=0x00, но клавиша НЕ
 ;             потребляется - следующий AH=0x00/0x01 увидит её снова)
-; Поверх того же "сырого" поллинга портов 0x60/0x64 (Scan Set 2), что
-; уже используется в setup_menu, но декодированного в ASCII через
+; Поверх того же поллинга портов 0x60/0x64 (Scan Set 1, аппаратно
+; транслированный контроллером - см. фикс IRQ1 в post_keyboard_test),
+; что уже используется в setup_menu, но декодированного в ASCII через
 ; таблицы kbd_ascii_lo/kbd_ascii_hi и с учётом состояния Shift.
 ; Не поддерживаются: numpad, функциональные и прочие клавиши без
 ; ASCII-эквивалента (тихо игнорируются, как и всё вне MAX_SCAN), а
@@ -495,7 +724,6 @@ install_int16h_vector:
     ; гарантируем чистое состояние автомата разбора клавиатуры -
     ; RAM не обязана быть обнулена на старте (реальное железо после
     ; power-on этого не гарантирует).
-    mov byte [ss:RAM_BREAK_FLAG], 0
     mov byte [ss:RAM_KBD_SHIFT], 0
     mov byte [ss:RAM_KBD_PENDING], 0
 
@@ -591,14 +819,19 @@ int16h_check_key:
 .none:
     ret
 
-; Продвигает автомат разбора клавиатуры максимум на один "сырой" байт
-; Scan Set 2, если он уже доступен у контроллера (порт 0x64, бит 0) -
-; НЕ блокирует. Логика E0/F0 - та же, что в setup_menu (см. её
-; комментарий): E0 просто пропускается, F0 выставляет RAM_BREAK_FLAG
-; на один байт вперёд. Shift (0x12/0x59) обрабатывается отдельно - не
-; как обычная клавиша, а как модификатор для kbd_ascii_hi/_lo. Если
-; уже есть непотреблённая клавиша (RAM_KBD_PENDING=1) - ничего не
-; делает, чтобы её не затереть до того, как её заберут.
+; Продвигает автомат разбора клавиатуры максимум на один байт Scan
+; Set 1, если он уже доступен у контроллера (порт 0x64, бит 0) - НЕ
+; блокирует. С аппаратной трансляцией включённой (см. фикс IRQ1 в
+; post_keyboard_test) отпускание клавиши в Set 1 - это ОДИН байт
+; (код нажатия с установленным битом7), а не F0+код, как в сыром
+; Set 2 - поэтому отдельный флаг-автомат (RAM_BREAK_FLAG) больше не
+; нужен вообще. E0 (расширенная клавиша) по-прежнему просто
+; пропускается - то же осознанное упрощение, что и раньше (см.
+; комментарий у MAX_SCAN). Shift (0x2A/0x36 - Set 1 коды) обрабатывается
+; отдельно - не как обычная клавиша, а как модификатор для
+; kbd_ascii_hi/_lo. Если уже есть непотреблённая клавиша
+; (RAM_KBD_PENDING=1) - ничего не делает, чтобы её не затереть до
+; того, как её заберут.
 kbd_service:
     push ax
     push bx
@@ -615,21 +848,16 @@ kbd_service:
     cmp al, 0xE0
     je .done                     ; префикс расширенной клавиши - пропускаем
 
-    cmp al, 0xF0
-    jne .not_break_prefix
-    mov byte [ss:RAM_BREAK_FLAG], 1
-    jmp .done
-.not_break_prefix:
+    test al, 0x80
+    jz .make_event
 
-    cmp byte [ss:RAM_BREAK_FLAG], 0
-    je .make_event
-
-    ; код ОТПУСКАНИЯ (после F0) - из всех клавиш нас интересует
-    ; только отпускание Shift, остальное как и раньше просто игнорируем
-    mov byte [ss:RAM_BREAK_FLAG], 0
-    cmp al, 0x12
+    ; код ОТПУСКАНИЯ (бит7=1, Set 1) - из всех клавиш нас интересует
+    ; только отпускание Shift, остальное просто игнорируем
+    mov ah, al
+    and ah, 0x7F
+    cmp ah, 0x2A
     je .shift_release
-    cmp al, 0x59
+    cmp ah, 0x36
     je .shift_release
     jmp .done
 .shift_release:
@@ -637,9 +865,9 @@ kbd_service:
     jmp .done
 
 .make_event:
-    cmp al, 0x12
+    cmp al, 0x2A
     je .shift_press
-    cmp al, 0x59
+    cmp al, 0x36
     je .shift_press
 
     cmp al, MAX_SCAN
@@ -658,8 +886,7 @@ kbd_service:
     je .done                       ; в таблице пусто - непечатаемая клавиша
 
     mov byte [ss:RAM_KBD_PENDING_CHAR], ah
-    mov al, [cs:kbd_scan2to1+bx]     ; bx всё ещё = исходный Set 2 код (см. выше)
-    mov byte [ss:RAM_KBD_PENDING_SCAN], al
+    mov byte [ss:RAM_KBD_PENDING_SCAN], al   ; al уже Set 1 - трансляция не нужна
     mov byte [ss:RAM_KBD_PENDING], 1
     jmp .done
 
@@ -671,54 +898,30 @@ kbd_service:
     pop ax
     ret
 
-; Таблицы трансляции "сырого" Scan Set 2 make-кода (0x00-MAX_SCAN) в
-; ASCII. Индекс - сам скан-код; 0 = клавиша без ASCII-эквивалента.
-; Числовые коды вместо символьных литералов - там, где символ сам по
-; себе конфликтует с синтаксисом NASM (кавычки, обратный слэш): 8=BS,
-; 9=TAB, 13=CR(Enter), 27=ESC, 34=", 39=', 59=;, 92=\.
-MAX_SCAN equ 0x76
+; Таблицы трансляции Scan Set 1 make-кода (0x00-MAX_SCAN) в ASCII.
+; Индекс - сам скан-код (как его отдаёт контроллер с включённой
+; аппаратной трансляцией - см. фикс IRQ1 в post_keyboard_test); 0 =
+; клавиша без ASCII-эквивалента. Числовые коды вместо символьных
+; литералов - там, где символ сам по себе конфликтует с синтаксисом
+; NASM (кавычки, обратный слэш): 8=BS, 9=TAB, 13=CR(Enter), 27=ESC,
+; 34=", 39=', 58=:, 59=;, 92=\, 96=`, 124=|, 126=~.
+MAX_SCAN equ 0x58
 
 kbd_ascii_lo:
-    db 0,0,0,0,0,0,0,0,0,0,0,0,0,9,96,0                          ; 0x00-0x0F
-    db 0,0,0,0,0,'q','1',0,0,0,'z','s','a','w','2',0             ; 0x10-0x1F
-    db 0,'c','x','d','e','4','3',0,0,' ','v','f','t','r','5',0   ; 0x20-0x2F
-    db 0,'n','b','h','g','y','6',0,0,0,'m','j','u','7','8',0     ; 0x30-0x3F
-    db 0,',','k','i','o','0','9',0,0,'.','/','l',59,'p','-',0    ; 0x40-0x4F
-    db 0,0,39,0,'[','=',0,0,0,0,13,']',0,92,0,0                  ; 0x50-0x5F
-    db 0,0,0,0,0,0,8,0,0,0,0,0,0,0,0,0                           ; 0x60-0x6F
-    db 0,0,0,0,0,0,27                                            ; 0x70-0x76
+    db 0,27,'1','2','3','4','5','6','7','8','9','0','-','=',8,9      ; 0x00-0x0F
+    db 'q','w','e','r','t','y','u','i','o','p','[',']',13,0,'a','s'  ; 0x10-0x1F
+    db 'd','f','g','h','j','k','l',59,39,96,0,92,'z','x','c','v'     ; 0x20-0x2F
+    db 'b','n','m',',','.','/',0,0,0,' ',0,0,0,0,0,0                 ; 0x30-0x3F
+    db 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0                               ; 0x40-0x4F
+    db 0,0,0,0,0,0,0,0,0                                             ; 0x50-0x58
 
 kbd_ascii_hi:
-    db 0,0,0,0,0,0,0,0,0,0,0,0,0,9,126,0                         ; 0x00-0x0F
-    db 0,0,0,0,0,'Q','!',0,0,0,'Z','S','A','W','@',0             ; 0x10-0x1F
-    db 0,'C','X','D','E','$','#',0,0,' ','V','F','T','R','%',0   ; 0x20-0x2F
-    db 0,'N','B','H','G','Y','^',0,0,0,'M','J','U','&','*',0     ; 0x30-0x3F
-    db 0,'<','K','I','O',')','(',0,0,'>','?','L',58,'P','_',0    ; 0x40-0x4F
-    db 0,0,34,0,'{','+',0,0,0,0,13,'}',0,124,0,0                 ; 0x50-0x5F
-    db 0,0,0,0,0,0,8,0,0,0,0,0,0,0,0,0                           ; 0x60-0x6F
-    db 0,0,0,0,0,0,27                                            ; 0x70-0x76
-
-; Таблица перевода "сырого" Scan Set 2 make-кода в Scan Set 1 - тот
-; набор, который int 16h по спецификации обязан отдавать в AH,
-; НЕЗАВИСИМО от того, какой набор реально шлёт контроллер. Раньше
-; здесь просто отдавался сырой Set 2 байт как есть - работало для
-; всех наших собственных тестов (они опираются на AL/ASCII), но
-; настоящий GRUB на реальном железе пользователя вводил буквы
-; нормально (ASCII в AL верный), а Enter не срабатывал - потому что
-; GRUB, как и положено по спеке, распознаёт спецклавиши по AH
-; (Set 1 Enter=0x1C), а получал наш сырой Set 2 код (0x5A), который
-; ни с чем не совпадает. Тот же индекс (0x00-MAX_SCAN), что и у
-; kbd_ascii_lo/hi; 0 - для всего, что и так не имеет ASCII (никогда
-; не используется, см. .have_char в kbd_service).
-kbd_scan2to1:
-    db 0,0,0,0,0,0,0,0,0,0,0,0,0,0x0F,0x29,0                     ; 0x00-0x0F
-    db 0,0,0,0,0,0x10,0x02,0,0,0,0x2C,0x1F,0x1E,0x11,0x03,0      ; 0x10-0x1F
-    db 0,0x2E,0x2D,0x20,0x12,0x05,0x04,0,0,0x39,0x2F,0x21,0x14,0x13,0x06,0 ; 0x20-0x2F
-    db 0,0x31,0x30,0x23,0x22,0x15,0x07,0,0,0,0x32,0x24,0x16,0x08,0x09,0    ; 0x30-0x3F
-    db 0,0x33,0x25,0x17,0x18,0x0B,0x0A,0,0,0x34,0x35,0x26,0x27,0x19,0x0C,0 ; 0x40-0x4F
-    db 0,0,0x28,0,0x1A,0x0D,0,0,0,0,0x1C,0x1B,0,0x2B,0,0          ; 0x50-0x5F
-    db 0,0,0,0,0,0,0x0E,0,0,0,0,0,0,0,0,0                        ; 0x60-0x6F
-    db 0,0,0,0,0,0,0x01                                          ; 0x70-0x76
+    db 0,27,'!','@','#','$','%','^','&','*','(',')','_','+',8,9      ; 0x00-0x0F
+    db 'Q','W','E','R','T','Y','U','I','O','P','{','}',13,0,'A','S'  ; 0x10-0x1F
+    db 'D','F','G','H','J','K','L',58,34,126,0,124,'Z','X','C','V'   ; 0x20-0x2F
+    db 'B','N','M','<','>','?',0,0,0,' ',0,0,0,0,0,0                 ; 0x30-0x3F
+    db 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0                               ; 0x40-0x4F
+    db 0,0,0,0,0,0,0,0,0                                             ; 0x50-0x58
 
 ; Печать ASCIIZ-строки DS:SI на экран, поддерживает 13,10 (CR/LF).
 ; Управляется тумблером RAM_VGA_ON из setup-меню.
@@ -739,6 +942,18 @@ print_vga:
     pop si
     pop ax
     ret
+.noop:
+    ret
+
+; То же самое, что print_vga, но дополнительно уважает тумблер
+; "Quiet boot" - используется ТОЛЬКО для самих POST-сообщений
+; (баннер, тест памяти, самотест клавиатуры), не для setup-меню и не
+; для сообщений загрузки диска - те должны быть видны всегда,
+; независимо от Quiet boot.
+print_vga_post:
+    cmp byte [ss:RAM_QUIET_BOOT], 0
+    jne .noop
+    jmp print_vga
 .noop:
     ret
 
@@ -1076,7 +1291,7 @@ post_memory_test:
     mov si, msg_mem_test
     call print_serial
     mov si, msg_mem_test
-    call print_vga
+    call print_vga_post
 
     mov cx, 1              ; первый блок (сегмент 0) уже "дан по умолчанию"
     mov bx, 0x1000          ; тестируем со следующего 64KB-сегмента
@@ -1108,7 +1323,7 @@ post_memory_test:
     mov si, msg_kb
     call print_serial
     mov si, msg_kb
-    call print_vga
+    call print_vga_post
 
     pop es
     pop dx
@@ -1127,7 +1342,7 @@ post_keyboard_test:
     mov si, msg_kbd_test
     call print_serial
     mov si, msg_kbd_test
-    call print_vga
+    call print_vga_post
 
     mov cx, 0xFFFF
 .wait_input_empty:
@@ -1157,7 +1372,82 @@ post_keyboard_test:
     mov si, msg_ok
     call print_serial
     mov si, msg_ok
-    call print_vga
+    call print_vga_post
+
+    ; Самотест контроллера прошёл, но сам по себе он ещё не значит,
+    ; что контроллер будет поднимать линию IRQ1 при нажатии клавиши -
+    ; за это отвечает отдельный бит (бит0) в Controller Configuration
+    ; Byte, читаемом/записываемом командами 0x20/0x60 на порт 0x64.
+    ; Мы сами читаем клавиатуру только поллингом (см. kbd_service),
+    ; которому этот бит не нужен - поэтому раньше он никогда не
+    ; включался. Настоящий BIOS всегда включает его при POST; без
+    ; этого шага любая загруженная ОС с interrupt-driven (не polling)
+    ; клавиатурным драйвером не получит вообще ни одного прерывания,
+    ; даже если сама всё правильно настроила (свой IDT, свой remap
+    ; PIC) - на уровне ниже физически нечему сработать. Заодно
+    ; включаем бит6 (аппаратная трансляция Set 2 -> Set 1) - весь
+    ; клавиатурный стек ниже (kbd_service, setup_menu) теперь тоже
+    ; ждёт готовый Set 1 прямо с порта 0x60, как и настоящий BIOS.
+    ; Best-effort: таймаут на любом шаге просто пропускает остаток -
+    ; самотест уже прошёл, это не повод сообщать об ошибке.
+    mov cx, 0xFFFF
+.kbdcfg_wait_ibe1:
+    in al, 0x64
+    test al, 0x02
+    jz .kbdcfg_read_cmd
+    loop .kbdcfg_wait_ibe1
+    jmp .kbd_done
+
+.kbdcfg_read_cmd:
+    mov al, 0x20            ; "Read Controller Configuration Byte"
+    out 0x64, al
+
+    mov cx, 0xFFFF
+.kbdcfg_wait_obf:
+    in al, 0x64
+    test al, 0x01
+    jnz .kbdcfg_got_byte
+    loop .kbdcfg_wait_obf
+    jmp .kbd_done
+
+.kbdcfg_got_byte:
+    in al, 0x60
+    or al, 0x41              ; бит0=1: включить IRQ1; бит6=1: включить
+                                ; аппаратную трансляцию Set 2 -> Set 1 -
+                                ; так же, как это делает настоящий BIOS.
+                                ; Раньше здесь было наоборот (бит6=0,
+                                ; сырой Set 2), под собственную софтверную
+                                ; трансляцию - но внешний код (загруженная
+                                ; ОС), читающий порт 0x60 напрямую в обход
+                                ; int16h, ожидает готовый Set 1 оттуда же,
+                                ; откуда его ожидает настоящий BIOS. См.
+                                ; историю в claude.md про перепутанные
+                                ; символы при IRQ-driven вводе.
+    mov ah, al                 ; сохраняем новый байт на время ожидания порта
+
+    mov cx, 0xFFFF
+.kbdcfg_wait_ibe2:
+    in al, 0x64
+    test al, 0x02
+    jz .kbdcfg_write_cmd
+    loop .kbdcfg_wait_ibe2
+    jmp .kbd_done
+
+.kbdcfg_write_cmd:
+    mov al, 0x60             ; "Write Controller Configuration Byte"
+    out 0x64, al
+
+    mov cx, 0xFFFF
+.kbdcfg_wait_ibe3:
+    in al, 0x64
+    test al, 0x02
+    jz .kbdcfg_write_byte
+    loop .kbdcfg_wait_ibe3
+    jmp .kbd_done
+
+.kbdcfg_write_byte:
+    mov al, ah
+    out 0x60, al
     jmp .kbd_done
 
 .kbd_fail:
@@ -1184,10 +1474,29 @@ print_dec_ax:
     push si
     push ds
 
+    call num_to_dec_buf
+
+    mov si, RAM_DEC_BUF
+    call print_serial
+    mov si, RAM_DEC_BUF
+    call print_vga_post
+
+    pop ds
+    pop si
+    pop dx
+    pop cx
+    pop bx
+    ret
+
+; Конвертирует AX (0-65535) в ASCIIZ-строку в RAM_DEC_BUF (RAM,
+; сегмент 0x0000) - общая часть print_dec_ax и vga_print_dec_at,
+; выделена, чтобы не дублировать деление на 10 в столбик дважды.
+; Портит AX/BX/CX/DX/SI/DS - вызывающий сам решает, что сохранять.
+num_to_dec_buf:
     push ax
     xor ax, ax
     mov ds, ax              ; DS = 0x0000 (RAM), там лежит RAM_DEC_BUF
-    pop ax                   ; восстановили число для печати
+    pop ax                   ; восстановили число для конвертации
 
     mov bx, 10
     xor cx, cx
@@ -1196,7 +1505,7 @@ print_dec_ax:
     jne .divloop
     mov byte [RAM_DEC_BUF], '0'
     mov byte [RAM_DEC_BUF+1], 0
-    jmp .print_it
+    ret
 
 .divloop:
     cmp ax, 0
@@ -1220,18 +1529,6 @@ print_dec_ax:
     jmp .pop_digits
 .terminate:
     mov byte [si], 0
-
-.print_it:
-    mov si, RAM_DEC_BUF
-    call print_serial
-    mov si, RAM_DEC_BUF
-    call print_vga
-
-    pop ds
-    pop si
-    pop dx
-    pop cx
-    pop bx
     ret
 
 ; =========================================================
@@ -1308,29 +1605,126 @@ vga_print_at:
     pop ax
     ret
 
+; То же самое, что vga_print_at, но для числа (AX, 0-65535) вместо
+; готовой строки - переиспользует num_to_dec_buf, которым уже
+; пользуется print_dec_ax. DH/DL (позиция) и BL (атрибут) нужно
+; сохранить вокруг num_to_dec_buf - она сама портит BX/CX/DX/SI/DS.
+vga_print_dec_at:
+    push ax
+    push bx
+    push cx
+    push dx
+    push si
+    push ds
+
+    push dx                  ; сохраняем позицию (DH/DL)
+    push bx                   ; сохраняем атрибут (BL, целиком через BX)
+
+    call num_to_dec_buf
+
+    pop bx
+    pop dx
+
+    xor ax, ax
+    mov ds, ax
+    mov si, RAM_DEC_BUF
+    call vga_print_at
+
+    pop ds
+    pop si
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ret
+
+; =========================================================
+; Короткое окно после POST, где можно нажать Del, чтобы попасть в
+; setup - как у настоящего BIOS, вместо того чтобы открывать
+; setup-меню безусловно на каждой загрузке. Если Del не нажали за
+; отведённое время, RAM_ENTER_SETUP остаётся 0, и start: идёт сразу
+; к загрузке диска.
+;
+; Del на полноразмерной клавиатуре - расширенная клавиша (E0 53 в
+; Set 1); Del/"." на numpad с выключенным NumLock шлёт тот же код
+; 0x53 без префикса E0. Поскольку E0 в этом проекте везде просто
+; пропускается (см. комментарий у setup_menu), оба случая ловятся
+; одной и той же проверкой на следующем непропущенном байте - не
+; нужно отдельно разбирать расширенную последовательность.
+;
+; Таймаут - обычный instruction-count busy-wait (тот же приём, что и
+; у остальных таймаутов в проекте, см. например .srst_delay в
+; int13h_reset), без привязки к реальным секундам - подобран
+; тестированием в QEMU до субъективно комфортной паузы.
+; =========================================================
+KEY_DEL equ 0x53
+
+prompt_setup_key:
+    push ax
+    push cx
+    push dx
+
+    mov byte [ss:RAM_ENTER_SETUP], 0
+
+    mov si, msg_press_del
+    call print_serial
+    mov si, msg_press_del
+    call print_vga
+
+    mov dx, 1200
+.outer:
+    mov cx, 0xFFFF
+.wait:
+    in al, 0x64
+    test al, 0x01
+    jz .next
+
+    in al, 0x60
+
+    cmp al, 0xE0
+    je .next                     ; расширенный префикс - пропускаем
+
+    test al, 0x80
+    jnz .next                     ; отпускание - игнорируем
+
+    cmp al, KEY_DEL
+    jne .next
+
+    mov byte [ss:RAM_ENTER_SETUP], 1
+    jmp .done
+
+.next:
+    loop .wait
+    dec dx
+    jnz .outer
+
+.done:
+    pop dx
+    pop cx
+    pop ax
+    ret
+
 ; =========================================================
 ; Интерактивное setup-меню: стрелки вверх/вниз, Enter, Esc.
 ; Опрос клавиатуры - простым поллингом порта 0x64/0x60 (без
 ; IRQ/PIC).
 ;
-; ВАЖНО: контроллер здесь НЕ транслирует в Scan Code Set 1 -
-; отдаёт "сырой" Scan Code Set 2 (проверено эмпирически через
-; QEMU: стрелки идут как E0 72 / E0 75, Enter как 0x5A, Esc как
-; 0x76). Байт-префикс E0 (расширенная клавиша) просто
-; пропускаем. Префикс F0 означает "это код ОТПУСКАНИЯ клавиши" -
-; следующий байт совпадает с кодом нажатия, поэтому его нужно
-; отдельно игнорировать, иначе одно нажатие сработает дважды.
+; Контроллер транслирует в Scan Code Set 1 (см. фикс IRQ1 в
+; post_keyboard_test - бит6 Configuration Byte), как и настоящий
+; BIOS: стрелки идут как E0 48 / E0 50, Enter как 0x1C, Esc как
+; 0x01. Байт-префикс E0 (расширенная клавиша) просто пропускаем.
+; Отпускание клавиши в Set 1 - это ОДИН байт (код нажатия с битом7),
+; не отдельный префикс F0 - проверяем его прямо на входном байте.
 ; =========================================================
-KEY_UP    equ 0x75
-KEY_DOWN  equ 0x72
-KEY_ENTER equ 0x5A
-KEY_ESC   equ 0x76
+KEY_UP    equ 0x48
+KEY_DOWN  equ 0x50
+KEY_ENTER equ 0x1C
+KEY_ESC   equ 0x01
 
 setup_menu:
     push ax
 
     mov word [ss:RAM_MENU_SEL], 0
-    mov byte [ss:RAM_BREAK_FLAG], 0
 
 .redraw:
     call vga_clear_screen
@@ -1385,8 +1779,8 @@ setup_menu:
 .item1_status:
     call vga_print_at
 
-    ; --- пункт 2: Exit ---
-    mov dh, 6
+    ; --- пункт 2: Boot device ---
+    mov dh, 5
     mov dl, 2
     mov bl, 0x07
     cmp word [ss:RAM_MENU_SEL], 2
@@ -1395,8 +1789,63 @@ setup_menu:
 .item2_draw:
     mov si, menu_item2
     call vga_print_at
+    mov dh, 5
+    mov dl, 26
+    mov bl, 0x0F
+    cmp byte [ss:RAM_BOOT_DRIVE], 0x80
+    jne .item2_slave
+    mov si, str_master
+    jmp .item2_status
+.item2_slave:
+    mov si, str_slave
+.item2_status:
+    call vga_print_at
 
-    mov dh, 9
+    ; --- пункт 3: Quiet boot ---
+    mov dh, 6
+    mov dl, 2
+    mov bl, 0x07
+    cmp word [ss:RAM_MENU_SEL], 3
+    jne .item3_draw
+    mov bl, 0x70
+.item3_draw:
+    mov si, menu_item3
+    call vga_print_at
+    mov dh, 6
+    mov dl, 26
+    mov bl, 0x0F
+    cmp byte [ss:RAM_QUIET_BOOT], 0
+    jne .item3_on
+    mov si, str_off
+    jmp .item3_status
+.item3_on:
+    mov si, str_on
+.item3_status:
+    call vga_print_at
+
+    ; --- пункт 4: System Information (не тумблер, открывает экран) ---
+    mov dh, 8
+    mov dl, 2
+    mov bl, 0x07
+    cmp word [ss:RAM_MENU_SEL], 4
+    jne .item4_draw
+    mov bl, 0x70
+.item4_draw:
+    mov si, menu_item4
+    call vga_print_at
+
+    ; --- пункт 5: Exit ---
+    mov dh, 10
+    mov dl, 2
+    mov bl, 0x07
+    cmp word [ss:RAM_MENU_SEL], 5
+    jne .item5_draw
+    mov bl, 0x70
+.item5_draw:
+    mov si, menu_item5
+    call vga_print_at
+
+    mov dh, 13
     mov dl, 2
     mov bl, 0x08
     mov si, menu_hint
@@ -1411,17 +1860,8 @@ setup_menu:
     cmp al, 0xE0
     je .wait_key            ; префикс расширенной клавиши - просто пропускаем
 
-    cmp al, 0xF0
-    jne .not_break_prefix
-    mov byte [ss:RAM_BREAK_FLAG], 1
-    jmp .wait_key
-.not_break_prefix:
-
-    cmp byte [ss:RAM_BREAK_FLAG], 0
-    je .process_make
-    ; это код ОТПУСКАНИЯ клавиши (следует за F0) - игнорируем его
-    mov byte [ss:RAM_BREAK_FLAG], 0
-    jmp .wait_key
+    test al, 0x80
+    jnz .wait_key            ; бит7=1 - код ОТПУСКАНИЯ (Set 1, один байт) - игнорируем
 
 .process_make:
     cmp al, KEY_UP
@@ -1444,7 +1884,7 @@ setup_menu:
 
 .key_down:
     mov ax, [ss:RAM_MENU_SEL]
-    cmp ax, 2
+    cmp ax, 5
     jae .redraw
     inc ax
     mov [ss:RAM_MENU_SEL], ax
@@ -1456,7 +1896,13 @@ setup_menu:
     je .toggle_serial
     cmp ax, 1
     je .toggle_vga
-    jmp .key_esc          ; пункт 2 (Exit) по Enter
+    cmp ax, 2
+    je .toggle_boot_drive
+    cmp ax, 3
+    je .toggle_quiet
+    cmp ax, 4
+    je .show_system_info
+    jmp .key_esc          ; пункт 5 (Exit) по Enter
 
 .toggle_serial:
     xor byte [ss:RAM_SERIAL_ON], 1
@@ -1468,6 +1914,26 @@ setup_menu:
     call cmos_save_settings
     jmp .redraw
 
+.toggle_boot_drive:
+    cmp byte [ss:RAM_BOOT_DRIVE], 0x80
+    jne .set_master
+    mov byte [ss:RAM_BOOT_DRIVE], 0x81
+    jmp .boot_drive_saved
+.set_master:
+    mov byte [ss:RAM_BOOT_DRIVE], 0x80
+.boot_drive_saved:
+    call cmos_save_settings
+    jmp .redraw
+
+.toggle_quiet:
+    xor byte [ss:RAM_QUIET_BOOT], 1
+    call cmos_save_settings
+    jmp .redraw
+
+.show_system_info:
+    call system_info_screen
+    jmp .redraw
+
 .key_esc:
     call vga_clear_screen
     mov dh, 1
@@ -1476,6 +1942,255 @@ setup_menu:
     mov si, msg_setup_exit
     call vga_print_at
 
+    pop ax
+    ret
+
+; Заполняет RAM_CPU_BRAND ASCIIZ-строкой с моделью CPU через CPUID:
+; сначала честно проверяет, есть ли сам CPUID (переключение бита 21
+; EFLAGS - "ID flag", стандартный приём для реального режима, работает
+; и на 386/486 без CPUID, где бит просто не переключится), затем
+; смотрит на максимальный расширенный лист (EAX=0x80000000) - если
+; >=0x80000004, есть "brand string" (то самое "Intel(R) Core(TM)...",
+; три листа по 16 байт = 48 символов). Если brand string недоступен,
+; но CPUID есть - берём 12-байтный Vendor ID (EAX=0, всегда
+; поддерживается, если CPUID вообще есть). Если CPUID нет вообще -
+; честно "Unknown", а не молчим и не выдумываем - та же философия,
+; что и у AH=0x88/AH=0x08 в других местах проекта.
+cpu_get_brand:
+    pushad
+    push es
+    push ds
+
+    xor ax, ax
+    mov ds, ax
+    mov es, ax
+
+    pushfd
+    pop eax
+    mov ecx, eax
+    xor eax, 0x200000
+    push eax
+    popfd
+    pushfd
+    pop eax
+    push ecx
+    popfd
+    xor eax, ecx
+    test eax, 0x200000
+    jnz .cpuid_ok
+
+    mov si, str_cpu_unknown
+    mov di, RAM_CPU_BRAND
+.copy_unknown:
+    lodsb
+    stosb
+    cmp al, 0
+    jne .copy_unknown
+    jmp .done
+
+.cpuid_ok:
+    mov eax, 0x80000000
+    cpuid
+    cmp eax, 0x80000004
+    jb .use_vendor
+
+    mov edi, RAM_CPU_BRAND
+    mov eax, 0x80000002
+    cpuid
+    mov [edi], eax
+    mov [edi+4], ebx
+    mov [edi+8], ecx
+    mov [edi+12], edx
+    add edi, 16
+
+    mov eax, 0x80000003
+    cpuid
+    mov [edi], eax
+    mov [edi+4], ebx
+    mov [edi+8], ecx
+    mov [edi+12], edx
+    add edi, 16
+
+    mov eax, 0x80000004
+    cpuid
+    mov [edi], eax
+    mov [edi+4], ebx
+    mov [edi+8], ecx
+    mov [edi+12], edx
+    add edi, 16
+
+    mov byte [edi], 0     ; терминатор - 49-й байт RAM_CPU_BRAND
+
+    ; brand string обычно дополнен пробелами слева до фиксированной
+    ; ширины - подвинем начало строки к первому непробельному символу,
+    ; иначе на экране будет лишний отступ
+    mov si, RAM_CPU_BRAND
+.skip_spaces:
+    cmp byte [si], ' '
+    jne .found_start
+    inc si
+    jmp .skip_spaces
+.found_start:
+    cmp si, RAM_CPU_BRAND
+    je .done
+    mov di, RAM_CPU_BRAND
+.shift_loop:
+    lodsb
+    stosb
+    cmp al, 0
+    jne .shift_loop
+    jmp .done
+
+.use_vendor:
+    xor eax, eax
+    cpuid
+    mov edi, RAM_CPU_BRAND
+    mov [edi], ebx
+    mov [edi+4], edx
+    mov [edi+8], ecx
+    mov byte [edi+12], 0
+
+.done:
+    pop ds
+    pop es
+    popad
+    ret
+
+; =========================================================
+; Информационный экран (не тумблер, просто просмотр) - модель CPU
+; (см. cpu_get_brand), объём памяти (conventional через RAM_MEM_KB,
+; extended через CMOS - см. int15h_ext_mem_kb), геометрия дисков и
+; текущий загрузочный привод. Ничего не меняет. Геометрия HDD/floppy -
+; фиксированные константы (SPT_HDD/HPC_HDD/SPT_FLOPPY/HPC_FLOPPY, см.
+; их комментарий у int13h_get_params), поэтому просто печатаются как
+; готовые строки, а не собираются из чисел - у нас всё равно нет
+; IDENTIFY DEVICE, чтобы узнать настоящую геометрию диска.
+; =========================================================
+system_info_screen:
+    push ax
+    push dx
+    push bx
+    push si
+
+    call cpu_get_brand      ; заполняет RAM_CPU_BRAND - до vga_clear_screen
+                              ; не важно, но пусть весь сбор данных идёт
+                              ; одним блоком в начале
+    call vga_clear_screen
+
+    mov dh, 1
+    mov dl, 2
+    mov bl, 0x0F
+    mov si, sysinfo_title
+    call vga_print_at
+
+    mov dh, 3
+    mov dl, 2
+    mov bl, 0x07
+    mov si, sysinfo_cpu
+    call vga_print_at
+    mov dh, 3
+    mov dl, 24
+    mov bl, 0x0F
+    push ds                 ; RAM_CPU_BRAND - в RAM (сегмент 0), а не в
+    push ax                   ; ROM, где обычно живёт DS - vga_print_at
+    xor ax, ax                  ; читает строку через DS:SI, ей всё равно,
+    mov ds, ax                    ; какой DS у вызывающего
+    mov si, RAM_CPU_BRAND
+    call vga_print_at
+    pop ax
+    pop ds
+
+    mov dh, 5
+    mov dl, 2
+    mov bl, 0x07
+    mov si, sysinfo_mem_conv
+    call vga_print_at
+    mov dh, 5
+    mov dl, 24
+    mov bl, 0x0F
+    mov ax, [ss:RAM_MEM_KB]
+    call vga_print_dec_at
+    mov dh, 5
+    mov dl, 28
+    mov bl, 0x07
+    mov si, str_kb
+    call vga_print_at
+
+    mov dh, 6
+    mov dl, 2
+    mov bl, 0x07
+    mov si, sysinfo_mem_ext
+    call vga_print_at
+    call int15h_ext_mem_kb    ; ax = расширенная память в КБ (из CMOS)
+    mov dh, 6
+    mov dl, 24
+    mov bl, 0x0F
+    call vga_print_dec_at
+    mov dh, 6
+    mov dl, 28
+    mov bl, 0x07
+    mov si, str_kb
+    call vga_print_at
+
+    mov dh, 8
+    mov dl, 2
+    mov bl, 0x07
+    mov si, sysinfo_boot_drive
+    call vga_print_at
+    mov dh, 8
+    mov dl, 24
+    mov bl, 0x0F
+    cmp byte [ss:RAM_BOOT_DRIVE], 0x80
+    jne .info_slave
+    mov si, str_master
+    jmp .info_drive_status
+.info_slave:
+    mov si, str_slave
+.info_drive_status:
+    call vga_print_at
+
+    mov dh, 10
+    mov dl, 2
+    mov bl, 0x07
+    mov si, sysinfo_hdd_geom
+    call vga_print_at
+    mov dh, 10
+    mov dl, 24
+    mov bl, 0x0F
+    mov si, sysinfo_hdd_geom_val
+    call vga_print_at
+
+    mov dh, 11
+    mov dl, 2
+    mov bl, 0x07
+    mov si, sysinfo_fdd_geom
+    call vga_print_at
+    mov dh, 11
+    mov dl, 24
+    mov bl, 0x0F
+    mov si, sysinfo_fdd_geom_val
+    call vga_print_at
+
+    mov dh, 14
+    mov dl, 2
+    mov bl, 0x08
+    mov si, sysinfo_hint
+    call vga_print_at
+
+.wait_any_key:
+    in al, 0x64
+    test al, 0x01
+    jz .wait_any_key
+    in al, 0x60
+
+    cmp al, 0xE0
+    je .wait_any_key             ; расширенный префикс - пропускаем
+    test al, 0x80
+    jnz .wait_any_key            ; отпускание - ждём именно нажатия
+
+    pop si
+    pop bx
+    pop dx
     pop ax
     ret
 
@@ -1736,6 +2451,20 @@ int13h_read_sectors:
     push si
     push di
     push bp
+    push dx                     ; настоящий int 13h AH=0x02 не трогает DL/DH
+                                   ; на выходе, а ниже DX многократно
+                                   ; переиспользуется как адрес порта
+                                   ; (0x1F0-0x1F7) - без сохранения вызывающий
+                                   ; получил бы обратно DL=0xF0 (низкий байт
+                                   ; последнего mov dx,0x1F0) вместо своего
+                                   ; номера диска. Именно так и ловился этот
+                                   ; баг: GRUB читает diskboot.img (1 сектор),
+                                   ; получает "исправный" ответ, но с убитым
+                                   ; DL, и следующий же вызов (chтение
+                                   ; остального core.img) уходит с DL=0xF0 -
+                                   ; наша же проверка DL<0x82 (см. int13h_isr)
+                                   ; его честно отклоняет, GRUB печатает
+                                   ; "Read Error".
 
     mov di, bx                  ; di = буфер назначения (offset) - ES не
                                    ; трогаем, он уже = ES вызывающего кода
@@ -1900,6 +2629,7 @@ int13h_read_sectors:
     xor bl, bl
 
 .exit:
+    pop dx
     pop bp
     pop di
     pop si
@@ -2063,7 +2793,7 @@ boot_try_disk:
     mov es, ax
     mov ss, ax
     mov sp, BOOT_ADDR
-    mov dl, 0x80             ; номер загрузочного диска (первый HDD)
+    mov dl, [ss:RAM_BOOT_DRIVE]  ; номер загрузочного диска - из setup-меню
     jmp 0x0000:BOOT_ADDR      ; управление дальше не возвращается
 
 .boot_fail:
@@ -2074,8 +2804,12 @@ boot_try_disk:
     pop ax
     ret
 
-; Читает LBA=0 (1 сектор, 512 байт) с primary ATA master через PIO
-; в SS:BOOT_ADDR (SS=0x0000). CF=1 при ошибке/таймауте/отсутствии диска.
+; Читает LBA=0 (1 сектор, 512 байт) с primary ATA master/slave (см.
+; RAM_BOOT_DRIVE, настраивается в setup-меню) через PIO в SS:BOOT_ADDR
+; (SS=0x0000). CF=1 при ошибке/таймауте/отсутствии диска. Тот же
+; диск, что потом получит загруженный код в DL (см. boot_try_disk) -
+; иначе можно было бы прочитать MBR с одного физического диска, а
+; передать управление с DL другого.
 ata_read_mbr:
     push ax
     push cx
@@ -2088,6 +2822,10 @@ ata_read_mbr:
 
     mov dx, 0x1F6
     mov al, 0xE0              ; master, LBA-режим, биты 24-27 LBA = 0
+    cmp byte [ss:RAM_BOOT_DRIVE], 0x81
+    jne .drive_select_ready
+    or al, 0x10                 ; slave (бит4 регистра drive/head)
+.drive_select_ready:
     out dx, al
 
     mov dx, 0x1F2
@@ -2200,8 +2938,11 @@ cmos_write_byte:
     pop ax
     ret
 
-; Загружает RAM_SERIAL_ON/RAM_VGA_ON из CMOS, если там наша
-; сигнатура, иначе выставляет значения по умолчанию и сохраняет их.
+; Загружает RAM_SERIAL_ON/RAM_VGA_ON/RAM_BOOT_DRIVE/RAM_QUIET_BOOT из
+; CMOS, если там наша сигнатура, иначе выставляет значения по
+; умолчанию и сохраняет их. Формат байта настроек: бит0=Serial,
+; бит1=VGA, бит2=Boot drive (0=master/0x80, 1=slave/0x81), бит3=Quiet
+; boot.
 cmos_load_settings:
     push ax
     push bx
@@ -2220,11 +2961,26 @@ cmos_load_settings:
     and bl, 0x02
     shr bl, 1
     mov [ss:RAM_VGA_ON], bl
+
+    mov bl, al
+    and bl, 0x04
+    mov bh, 0x80
+    jz .master_loaded
+    mov bh, 0x81
+.master_loaded:
+    mov [ss:RAM_BOOT_DRIVE], bh
+
+    mov bl, al
+    and bl, 0x08
+    shr bl, 3
+    mov [ss:RAM_QUIET_BOOT], bl
     jmp .done
 
 .defaults:
     mov byte [ss:RAM_SERIAL_ON], 1
     mov byte [ss:RAM_VGA_ON], 1
+    mov byte [ss:RAM_BOOT_DRIVE], 0x80
+    mov byte [ss:RAM_QUIET_BOOT], 0
     call cmos_save_settings     ; сразу сохраняем дефолты + сигнатуру
 
 .done:
@@ -2232,8 +2988,9 @@ cmos_load_settings:
     pop ax
     ret
 
-; Упаковывает текущие RAM_SERIAL_ON/RAM_VGA_ON в один байт и
-; сохраняет в CMOS вместе с сигнатурой.
+; Упаковывает текущие RAM_SERIAL_ON/RAM_VGA_ON/RAM_BOOT_DRIVE/
+; RAM_QUIET_BOOT в один байт и сохраняет в CMOS вместе с сигнатурой -
+; формат см. в комментарии у cmos_load_settings.
 cmos_save_settings:
     push ax
     push bx
@@ -2243,6 +3000,22 @@ cmos_save_settings:
     mov bh, [ss:RAM_VGA_ON]
     and bh, 1
     shl bh, 1
+    or bl, bh
+
+    mov bh, [ss:RAM_BOOT_DRIVE]
+    cmp bh, 0x81
+    jne .master_bit
+    mov bh, 1
+    jmp .drive_bit_ready
+.master_bit:
+    xor bh, bh
+.drive_bit_ready:
+    shl bh, 2
+    or bl, bh
+
+    mov bh, [ss:RAM_QUIET_BOOT]
+    and bh, 1
+    shl bh, 3
     or bl, bh
 
     mov al, CMOS_CFG_OFFSET
@@ -2272,11 +3045,30 @@ msg_done:     db "POST complete.", 13, 10, 0
 menu_title:   db "SilentBIOS Setup", 0
 menu_item0:   db "Serial (COM1) output", 0
 menu_item1:   db "VGA output", 0
-menu_item2:   db "Exit", 0
+menu_item2:   db "Boot device", 0
+menu_item3:   db "Quiet boot", 0
+menu_item4:   db "System Information", 0
+menu_item5:   db "Exit", 0
 menu_hint:    db "Arrows: Move   Enter: Toggle/Select   Esc: Exit", 0
 str_on:       db "ON ", 0
 str_off:      db "OFF", 0
+str_master:   db "Master", 0
+str_slave:    db "Slave ", 0
+str_kb:       db " KB", 0
 msg_setup_exit: db "Setup closed.", 0
+msg_press_del: db "Press DEL to enter SETUP...", 13, 10, 0
+
+sysinfo_title:        db "System Information", 0
+sysinfo_cpu:          db "Processor:", 0
+str_cpu_unknown:      db "Unknown (no CPUID)", 0
+sysinfo_mem_conv:     db "Conventional memory:", 0
+sysinfo_mem_ext:      db "Extended memory:", 0
+sysinfo_boot_drive:   db "Boot drive:", 0
+sysinfo_hdd_geom:     db "HDD geometry:", 0
+sysinfo_fdd_geom:     db "Floppy geometry:", 0
+sysinfo_hdd_geom_val: db "63 sectors/track, 16 heads", 0
+sysinfo_fdd_geom_val: db "18 sectors/track, 2 heads", 0
+sysinfo_hint:         db "Press any key to return", 0
 
 msg_boot_try:  db "Booting: reading MBR from disk (ATA PIO)...", 13, 10, 0
 msg_boot_jump: db "Valid boot signature found, jumping to 0x7C00...", 13, 10, 0

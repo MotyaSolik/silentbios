@@ -142,22 +142,40 @@ make
 ## Running
 
 ```bash
-# No disk attached: POST, VGA, setup menu, then boot attempt reports
-# "No bootable disk found"
+# No disk attached: POST, then boot attempt reports "No bootable disk found"
 make run_nhda
 
 # With the test boot sector attached
 make run
 ```
 
-In the setup menu: Up/Down navigates, Enter toggles the selected item (or
-exits, on the Exit item), Esc exits setup and continues the normal boot
-sequence (the disk MBR read).
+POST ends with a "Press DEL to enter SETUP..." prompt, same convention as
+a real BIOS — press Del within the short window that follows to open the
+setup menu; otherwise boot proceeds on its own. In the menu: Up/Down
+navigates, Enter toggles the selected item (or opens it, for System
+Information; or exits, on the Exit item), Esc exits setup and continues
+the normal boot sequence (the disk MBR read). Settings persist in
+CMOS/NVRAM:
 
-After Esc, `make run` boots the test disk, which prints a plain-language,
-step-by-step narration of every `int 10h`/`int 16h`/`int 13h` call it
-makes (`stage2.asm`) — type a few keys when it asks, and read the `-> OK`
-lines to see what's actually being exercised.
+- **Serial (COM1) output** / **VGA output** — the two original toggles.
+- **Boot device** — Master or Slave; which physical disk `ata_read_mbr`
+  reads and which `DL` gets handed to the loaded code (see "Design
+  notes" — these two used to be able to disagree, which was its own
+  latent bug).
+- **Quiet boot** — suppresses the POST banner/memory-test/keyboard-test
+  lines on VGA (serial output is unaffected, controlled separately).
+  Errors are never suppressed, quiet or not.
+- **System Information** — a read-only screen: CPU model (via `CPUID`'s
+  brand string, falling back to the 12-byte vendor ID or an honest
+  "Unknown (no CPUID)" on anything old enough not to have it),
+  conventional/extended memory, current boot drive, HDD/floppy CHS
+  geometry. Any key returns to the menu.
+
+After Esc (or after the Del-prompt times out on its own), the test disk
+prints a plain-language, step-by-step narration of every `int 10h`/
+`int 16h`/`int 13h` call it makes (`stage2.asm`) — type a few keys when
+it asks, and read the `-> OK` lines to see what's actually being
+exercised.
 
 ## Design notes
 
@@ -174,15 +192,39 @@ source:
 - **There's no video BIOS underneath us**, so entering 80×25 text mode,
   loading the font into Character Generator RAM (video memory plane 2), and
   programming the DAC palette are all done by hand, register by register.
-- **The keyboard controller emits Scan Code Set 2**, not Set 1 — confirmed
-  empirically, not assumed from documentation. The key-handling code
-  accounts for that, plus the fact that a key's "release" code (`F0 xx`)
-  ends in the same byte as its "press" code.
+- **The keyboard controller natively emits Scan Code Set 2**, not Set 1 —
+  confirmed empirically, not assumed from documentation. This project
+  used to decode raw Set 2 itself (accounting for `F0 xx` release codes
+  and translating to Set 1 only for `int 16h`'s `AH` output), but now
+  enables the controller's own hardware Set 2→Set 1 translation instead
+  (8042 Configuration Byte, bit 6 — the same thing a real BIOS does).
+  Everything downstream — `kbd_service`, `setup_menu`, and any loaded
+  code reading port `0x60` directly — now sees standard Set 1 (release =
+  make code with bit 7 set, a single byte, not a separate `F0` prefix
+  byte). Switched after a real IRQ-driven OS kernel, once IRQ delivery
+  itself started working, decoded every key wrong in a very specific
+  way (`h` as `,`, `e` as `j`, ...) and duplicated every keystroke —
+  it was reading raw Set 2 off the wire and interpreting it as Set 1,
+  exactly backwards from this project's own translate-in-software
+  approach. See the Local APIC LVT0 entry further down (under "Known
+  limitations") for why this only surfaced once real IRQ delivery did.
 - **The BIOS's own boot code can't call `int 13h`** — it's the thing
   *providing* that service, not consuming it, so its own MBR read
   (`ata_read_mbr`) still talks to the ATA controller ports directly.
   Loaded code (a bootloader, a second stage, an OS) *can* call `int 13h`,
   same as it would on real hardware.
+- **A latent bug that adding the "Boot device" setup item exposed
+  immediately**: `ata_read_mbr` always addressed the ATA master
+  unconditionally, while `boot_try_disk` handed the loaded code whatever
+  `DL` the setup menu had picked — meaning "Slave" could read the
+  master's MBR into memory and then jump into it claiming to be the
+  slave. Harmless while the drive selector was hardcoded (both always
+  agreed, by construction), impossible to miss the moment it became a
+  setting: booting "Slave" with only a master attached correctly failed
+  with "No bootable disk found" instead of silently booting the wrong
+  disk under the wrong identity. Fixed by making `ata_read_mbr` read
+  `RAM_BOOT_DRIVE` for its own master/slave select on port `0x1F6`,
+  the same value `boot_try_disk` puts in `DL` right after.
 - **`int 16h` `AH=0x01` and `int 13h` (`AH=0x00`/`0x02`/`0x08`) return
   their result through a flag** (`ZF` / `CF`) — but `iret` restores `FLAGS`
   from what the CPU pushed onto the stack when the interrupt was invoked,
@@ -210,6 +252,82 @@ source:
   sailing straight through to completion while the screen stayed frozen).
   Fixed with a `vga_scroll_up` that the write path calls once the cursor
   would cross row 25: copy rows 1–24 up into 0–23, blank the new row 24.
+- **The 8259 PIC is reprogrammed (remapped) during POST**, same as any
+  real PC/AT BIOS: master IRQ0-7 → `INT 0x08`-`0x0F`, slave IRQ8-15 →
+  `INT 0x70`-`0x77`, with IRQ0/1/2 left unmasked. This project never
+  enables interrupts itself (`IF` stays 0 the whole way through POST/setup
+  — nothing here handles an IRQ), so skipping this would have been
+  invisible in every one of this project's own tests. First suspected as
+  the whole story behind a loaded OS's own PS/2 keyboard driver getting no
+  input under this BIOS while working under a real one — but that OS
+  turned out to do its own complete PIC remap, making this moot for that
+  specific bug (see the next point for the real cause). Kept anyway: it's
+  genuinely missing real-BIOS behavior, and some other loaded OS could
+  still rely on it being done already.
+- **The keyboard controller won't raise IRQ1 unless explicitly told to.**
+  Passing the `0xAA` self-test is not the same as enabling interrupt
+  generation — that's a separate bit (bit 0) in the 8042 Controller
+  Configuration Byte (command `0x20`/`0x60` on port `0x64`), and this
+  project's own keyboard access is 100% polling, so nothing here had ever
+  needed that bit set. Fixed by reading the Configuration Byte after a
+  successful self-test, setting bit 0 (IRQ1 enable) and explicitly
+  clearing bit 6 (hardware Set 2→Set 1 translation, which must stay off —
+  this project's whole keyboard stack depends on raw Set 2), then writing
+  it back. Real and correct, but — see the next point — turned out not to
+  be the whole story for actually getting an IRQ to a loaded OS.
+- **Legacy PIC interrupts don't reach the CPU at all unless the Local
+  APIC's LINT0 pin is explicitly unmasked — on top of the PIC and 8042
+  both being correctly configured, as above.** On any CPU with a Local
+  APIC (effectively everything this BIOS runs on, including QEMU), IRQs
+  from the 8259 reach the CPU core through that pin, and per the Intel
+  SDM it resets to *masked*. A real BIOS always programs it (LVT LINT0
+  register, physical address `0xFEE00350`, delivery mode ExtINT) during
+  POST; confirmed empirically with a dedicated 32-bit multiboot test
+  kernel that interrupts genuinely started arriving only once that
+  register was written. The catch: that address isn't reachable from
+  16-bit real mode, so fixing it means briefly entering 32-bit mode
+  during POST. A first attempt using a full real→protected→real
+  round-trip (changing `CS` via a far `jmp`, then trying to jump back)
+  reproducibly stalled on the return leg for reasons that resisted
+  register-dump and GDB-remote debugging, and was reverted rather than
+  shipped half-working. The version that actually works uses "unreal
+  mode" instead: enter protected mode, load *only* `ES` with a flat
+  descriptor, drop back to real mode — `CS` is never touched at all, so
+  there's no return jump to get wrong. Also needed (found the same way,
+  by testing rather than assuming): the Local APIC's Spurious Interrupt
+  Vector Register (`0xFEE000F0`) has its own separate "software enable"
+  bit that has to be set too, or LVT LINT0 being correctly unmasked
+  still delivers nothing. And unmasking real IRQ0/IRQ1 delivery, once it
+  actually works, exposed one more gap: any loaded code that does a
+  plain `sti` (the standard convention for real-mode bootloaders,
+  including this project's own `boot.asm`) now expects a real BIOS's
+  usual `INT 0x08`/`INT 0x09` handlers to already be installed — without
+  them, the first timer tick jumps into whatever garbage happens to be
+  at that IVT slot. Fixed by adding minimal versions of both: `INT 0x08`
+  ticks the standard BDA counter and sends `EOI`; `INT 0x09` calls the
+  existing `kbd_service` (the same one `int 16h` polls) directly, since
+  by the time the ISR runs, a byte is already guaranteed to be sitting
+  at port `0x60` — one decode path serves both polling and IRQ-driven
+  callers. Verified with a dedicated real-mode IRQ1 counter test (both
+  press and release events counted correctly), the existing regression
+  disk, GRUB's own menu, and — after finding and fixing a wrong
+  hardcoded code-segment selector in the *test* kernel itself, which is
+  what had been causing its crash, not this BIOS — the same 32-bit
+  multiboot kernel that was used to originally diagnose the problem.
+  Getting real IRQ delivery working surfaced one more, final gap the
+  same session: a real IRQ-driven OS decoded every key wrong in a
+  specific, decodable way (`h` → `,`, `e` → `j`, every key duplicated)
+  — see the Scan Set 2 vs. Set 1 entry above under "Design notes" for
+  that story and its fix.
+- **A disk function that "successfully" hands back the wrong drive
+  number is worse than one that fails.** `int13h_read_sectors` reused
+  `DX` as a scratch register for ATA port addresses and never restored
+  it, so callers got back `DL=0xF0` (leftover from the last port write)
+  instead of their own drive number — invisible while nothing checked
+  `DL` strictly, then surfaced as a real GRUB boot regressing straight
+  to `Read Error` the moment drive-number validation got stricter
+  elsewhere. Fixed by giving it the same `push dx`/`pop dx` wrapping
+  `int13h_reset` already had.
 
 ## Known limitations
 
