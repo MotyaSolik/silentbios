@@ -242,6 +242,36 @@ source:
   For video/keyboard, silently doing nothing is the safer default; for
   disk I/O, silently claiming success when nothing happened is worse than
   an honest error — the caller might act on data that was never read.
+- **`patch_stack_cf` used to clobber `BX` as an implementation detail,
+  invisible until a function actually needed to return something in
+  `BX`.** It reads its 0/1 signal from `BL` (by design — documented as
+  "not preserved" for every function that used it) but also used `BH` as
+  scratch space for reading/writing the stacked `FLAGS` byte, silently
+  destroying the *entire* register. Fine for `AH=0x00`/`0x02`/`0x08`/
+  `0x88`, none of which document `BX` as output — until `AH=0x41` (check
+  extensions), which by spec must return `BX=0xAA55` on success, hit the
+  exact same shared helper. Caught immediately by testing (a dedicated
+  test disk expecting `BX=0xAA55` got `BX` back with a plausible-looking
+  but wrong value the first two times, precisely tracked down by dumping
+  `BX` to memory *before* any further code could touch it) rather than
+  trusting that "it compiles and doesn't crash" meant it worked. Two
+  fixes, not one: `patch_stack_cf` itself now uses `AX` (saved and
+  restored around the patch, so it's fully transparent to callers)
+  instead of clobbering `BH`; and `int13h_check_extensions`'s caller
+  saves the real `BX=0xAA55` on the stack before computing the signal
+  bit and restores it right after — because *even the fixed*
+  `patch_stack_cf` still intentionally discards `BL` as its own signal
+  input, which is correct for every other function but not this one.
+- **The `DX`-preservation fix for `int13h_read_sectors` (see the `DL`
+  entry above) had to be re-discovered and re-applied for
+  `int13h_read_sectors_lba` (`AH=0x42`) separately** — copy-pasting the
+  shared ATA-transfer loop into a new entry point doesn't copy-paste the
+  lesson that came with it. Same regression, same symptom (GRUB's own
+  `Read Error`, this time triggered by GRUB actually using `AH=0x42`
+  once `AH=0x41` started honestly advertising support for it), same
+  root cause (`ata_lba_transfer` reusing `DX` for ATA port addresses,
+  leaving the caller's `DL` overwritten on return) — just in the one
+  code path that hadn't existed yet the first time this was found.
 - **Text past the last row used to just vanish.** `vga_char_out`'s newline
   handler only ever computed the *next* row's offset — nothing stopped it
   from computing a position past row 24 and writing there anyway, off the
@@ -343,13 +373,21 @@ source:
   non-ASCII keys). Extended (`E0`-prefixed) keys are skipped rather than
   decoded, which means an extended key can alias a numpad key with the same
   trailing scan code — accepted as a simplification, not fixed.
-- The `int 13h` handler supports `AH=0x00`/`0x02`/`0x08` only, translates
-  CHS to LBA against an assumed (not queried) geometry picked from the
-  drive number alone (`18/2` for `DL<0x80`, `63/16` for `DL>=0x80`), and
-  doesn't implement `IDENTIFY DEVICE` — `AH=0x08` always reports a generic
-  maximum-cylinder value regardless of the actual disk image size. Sectors
-  are read one at a time (no true multi-sector burst transfer), which is
-  simpler and more robust but slower.
+- The `int 13h` handler supports `AH=0x00`/`0x02`/`0x08`/`0x41`/`0x42`,
+  translates CHS to LBA against an assumed (not queried) geometry picked
+  from the drive number alone (`18/2` for `DL<0x80`, `63/16` for
+  `DL>=0x80`), and doesn't implement `IDENTIFY DEVICE` — `AH=0x08` always
+  reports a generic maximum-cylinder value regardless of the actual disk
+  image size. `AH=0x41` (check extensions) advertises the whole "base"
+  EDD subset per spec (there's no finer-grained bit for "read but not
+  write"), but only `AH=0x42` (extended/LBA read via a Disk Address
+  Packet) is actually implemented — `AH=0x43` (extended write) honestly
+  fails like any other unimplemented function; this project doesn't write
+  to disk anywhere yet, CHS or LBA. Sectors are read one at a time (no
+  true multi-sector burst transfer), which is simpler and more robust but
+  slower — `AH=0x02` and `AH=0x42` share the same underlying transfer
+  loop (`ata_lba_transfer`), parameterized by LBA/count/buffer instead of
+  duplicated.
 - A real FreeDOS floppy boots noticeably further with the `int 13h`
   geometry fix (its boot sector's own reads now land on the right
   sectors) but still doesn't reach a working prompt — and, confirmed via

@@ -806,6 +806,73 @@ needs. Verified against actual QEMU output: `QEMU Virtual CPU version
 2.5+`, trimmed and positioned correctly on the System Information
 screen alongside everything else.
 
+**`int 13h` grew `AH=0x41`/`0x42` (EDD extensions check + LBA extended
+read), on request - and immediately relearned two lessons this project
+had already paid for once.** Implementation itself: `int13h_read_sectors`
+already had a working CHS-to-LBA path ending in a plain sector-transfer
+loop over `cx:bx` (LBA), `bp` (count), `es:di` (buffer) - extracted that
+tail into a shared `ata_lba_transfer`, so `AH=0x42` just needs to parse
+the Disk Address Packet (`DS:SI`, standard 16-byte layout: count at
+`+2`, buffer offset/segment at `+4`/`+6`, LBA low 32 bits at `+8`) into
+those same three inputs and call the same core - no duplicated ATA PIO
+logic. `AH=0x41` alone wouldn't have been enough to matter: a
+well-behaved caller (GRUB included, confirmed by this project's own
+earlier history of it correctly falling back to `AH=0x02` after `AH=0x41`
+failed) checks for extended support *before* ever trying `AH=0x42`, so
+skipping `AH=0x41` would have made the new `AH=0x42` code dead weight
+that no real caller would ever reach.
+
+First relearned lesson: `patch_stack_cf` - the shared helper every
+`int 13h` function uses to set `CF` in the stacked `FLAGS` word before
+`iret` - had always used `BH` as scratch space for reading and rewriting
+that byte, silently discarding whatever was in `BX` on the way out. This
+was invisible for every function implemented so far (`AH=0x00`/`0x02`/
+`0x08`, plus `int 15h`'s `AH=0x88`) because none of them document `BX`
+as part of their output - until `AH=0x41`, which by spec must hand back
+`BX=0xAA55` on success. A dedicated test disk built specifically to
+check for that value got a wrong-but-plausible-looking `BX` back twice
+in a row, tracked down by capturing `CF`/`BX`/`AH` to a fixed memory
+location immediately after the `int 13h` call - before any further code
+(including this project's own `print_string`, which itself clobbers `BX`
+setting the video attribute byte, the same well-known gotcha from
+`stage2.asm`'s own history biting a debug script this time instead of
+the BIOS itself) got a chance to touch the registers being inspected.
+First pass at `BX=0xAA00` (high byte right, low byte zeroed) pointed
+straight at `patch_stack_cf`'s `BH` scratch use; fixing that (switched
+to `AX`, saved and restored around the patch so it's fully transparent)
+surfaced a *second*, self-inflicted instance of the identical mistake -
+`int13h_check_extensions`'s caller computed the `patch_stack_cf` signal
+bit with `xor bl, bl`, still stepping on the low byte of the very
+`BX=0xAA55` it had just set two lines earlier, just moved from inside
+the function to its call site. Final fix needed a third register
+entirely: push the real `BX` onto the stack right after
+`int13h_check_extensions` returns, compute and use the signal bit freely
+(`patch_stack_cf` is *always* going to discard `BL` - that's the
+documented, correct behavior for every other function, not a bug to work
+around generally), then pop the real `BX` back before `iret`.
+
+Second relearned lesson, immediately after the first: GRUB regressed
+straight back to its own `Read Error` the moment `AH=0x41` started
+honestly advertising support - because that's exactly what let GRUB
+actually start calling the new `AH=0x42` for real, instead of falling
+back to the already-working `AH=0x02` it had used every time before.
+Root cause was the *exact* bug this project had already found and fixed
+once this session, in the exact same shape: `ata_lba_transfer` reuses
+`DX` freely as the ATA port-address register, and `int13h_read_sectors_lba`
+- unlike `int13h_read_sectors`, which has a `push dx`/`pop dx` specifically
+because of that earlier bug - never saved the caller's `DL` around the
+call. Writing the new function by adapting a working pattern carried over
+the parts that were obviously relevant (DAP parsing, drivebit selection)
+and silently dropped the one-line fix that wasn't visible anywhere in the
+code being copied from, only in a comment explaining *why* it was there.
+Fixed the same way as before: `push dx` at entry, `pop dx` before `ret`.
+Both fixes verified together: the dedicated `AH=0x41`/`AH=0x42` test disk
+(extensions check returns `BX=0xAA55`/`AH=0x01`/`CF=0` correctly now; a
+1-sector `AH=0x42` read of the boot sector's own LBA 0 into a second
+buffer byte-for-byte matches what's actually loaded at `0x7C00`), the
+existing regression disk, and GRUB reaching its real menu again instead
+of `Read Error`.
+
 The test disk (`boot.asm`+`stage2.asm`) is a real two-stage loader now,
 not one packed sector: stage 1 reads stage 2 via `int 13h` `AH=0x02` and
 jumps to it, which is both a demonstration of that call and the reason
